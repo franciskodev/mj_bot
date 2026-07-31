@@ -1,0 +1,22 @@
+[Unit]
+Description=Interpol Discord Bot
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=francisko
+Group=francisko
+WorkingDirectory=/home/francisko/interpol
+EnvironmentFile=/home/francisko/interpol/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/francisko/interpol/venv/bin/python /home/francisko/interpol/main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
