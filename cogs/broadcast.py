@@ -10,7 +10,7 @@ from config import GUILD_ID, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import InterpolBot
+    from bot import IntoleranceBot
 
 
 @dataclass
@@ -39,7 +39,7 @@ class BroadcastSession:
 
 
 class BroadcastControlView(disnake.ui.View):
-    def __init__(self, session: BroadcastSession, bot: "InterpolBot") -> None:
+    def __init__(self, session: BroadcastSession, bot: "IntoleranceBot") -> None:
         super().__init__(timeout=None)
         self.session = session
         self.bot = bot
@@ -104,7 +104,7 @@ class BroadcastControlView(disnake.ui.View):
 
 
 class BroadcastCog(commands.Cog):
-    def __init__(self, bot: "InterpolBot") -> None:
+    def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
         self.current_session: BroadcastSession | None = None
         self.broadcast_task: asyncio.Task[None] | None = None

@@ -9,7 +9,7 @@ from config import GUILD_ID, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import InterpolBot
+    from bot import IntoleranceBot
 
 
 STATUS_COLORS = {
@@ -53,14 +53,14 @@ def profile_embed(user: disnake.User | disnake.Member, profile: asyncpg.Record, 
         value=format_date(profile["guild_joined_at"]),
         inline=False,
     )
-    embed.set_footer(text="INTERPOL • Профиль участника")
+    embed.set_footer(text="INTOLERANCE • Профиль участника")
     return embed
 
 
 class ServerSelect(disnake.ui.StringSelect):
     def __init__(
         self,
-        bot: "InterpolBot",
+        bot: "IntoleranceBot",
         owner: disnake.Member,
         current_servers: str | None,
     ) -> None:
@@ -112,7 +112,7 @@ class ServerSelect(disnake.ui.StringSelect):
 class UserServerView(disnake.ui.View):
     def __init__(
         self,
-        bot: "InterpolBot",
+        bot: "IntoleranceBot",
         owner: disnake.Member,
         current_servers: str | None,
     ) -> None:
@@ -122,7 +122,7 @@ class UserServerView(disnake.ui.View):
 
 
 class UsersCog(commands.Cog):
-    def __init__(self, bot: "InterpolBot") -> None:
+    def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
 
     @commands.slash_command(

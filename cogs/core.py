@@ -8,11 +8,11 @@ from config import DEFAULT_MEMBER_ROLE_ID, GUILD_ID, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import InterpolBot
+    from bot import IntoleranceBot
 
 
 class CoreCog(commands.Cog):
-    def __init__(self, bot: "InterpolBot") -> None:
+    def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
 
     @commands.Cog.listener()

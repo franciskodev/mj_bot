@@ -12,7 +12,7 @@ from log_utils import send_admin_log
 from transcript import save_application_json, save_ticket_transcript
 
 if TYPE_CHECKING:
-    from bot import InterpolBot
+    from bot import IntoleranceBot
 
 
 STATUS_NAMES = {
@@ -60,7 +60,7 @@ def application_embed(
     embed.add_field(name="🖼️ Ссылка на фото", value=application["screenshot_url"], inline=False)
     embed.add_field(name="👤 Пользователь", value=f"{applicant.mention}\n`{applicant}` · `{applicant.id}`", inline=False)
     embed.add_field(name="📌 Статус", value=STATUS_NAMES[application["status"]], inline=False)
-    embed.set_footer(text="INTERPOL • Набор в семью")
+    embed.set_footer(text="INTOLERANCE • Набор в семью")
     return embed
 
 
@@ -171,7 +171,7 @@ class ApplicationModal(disnake.ui.Modal):
 
 
 class ApplicationsCog(commands.Cog):
-    def __init__(self, bot: "InterpolBot") -> None:
+    def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
 
     @commands.slash_command(
@@ -207,7 +207,7 @@ class ApplicationsCog(commands.Cog):
             description="Нажмите кнопку ниже и заполните небольшую анкету. После отправки будет создан приватный тикет с рекрутёрами.",
             color=disnake.Color.red(),
         )
-        embed.set_footer(text="INTERPOL • Набор в семью")
+        embed.set_footer(text="INTOLERANCE • Набор в семью")
         button = disnake.ui.Button(
             label="Подать заявку в семью", emoji="📝", style=disnake.ButtonStyle.danger,
             custom_id="family_application:open",

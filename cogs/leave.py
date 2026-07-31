@@ -8,11 +8,11 @@ from config import ADMIN_LOG_CHANNEL_ID, GUILD_ID
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import InterpolBot
+    from bot import IntoleranceBot
 
 
 class LeaveCog(commands.Cog):
-    def __init__(self, bot: "InterpolBot") -> None:
+    def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
 
     @commands.slash_command(name="leave", description="Управление отпуском", guild_ids=[GUILD_ID])
@@ -62,7 +62,7 @@ class LeaveCog(commands.Cog):
         embed.add_field(name="📆 Срок", value=f"**{days}** дн.\nДо <t:{int(request['ends_at'].timestamp())}:D>", inline=True)
         embed.add_field(name="📝 Причина", value=reason, inline=False)
         embed.add_field(name="🆔 Discord ID", value=f"`{inter.author.id}`", inline=True)
-        embed.set_footer(text=f"INTERPOL • Заявка #{request['id']}")
+        embed.set_footer(text=f"INTOLERANCE • Заявка #{request['id']}")
         components = [
             disnake.ui.Button(label="Одобрить", emoji="✅", style=disnake.ButtonStyle.success, custom_id=f"leave:approved:{request['id']}"),
             disnake.ui.Button(label="Отклонить", emoji="✖️", style=disnake.ButtonStyle.danger, custom_id=f"leave:declined:{request['id']}"),

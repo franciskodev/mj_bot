@@ -7,11 +7,11 @@ from disnake.ext import commands
 from config import FORWARD_CHANNEL_ID
 
 if TYPE_CHECKING:
-    from bot import InterpolBot
+    from bot import IntoleranceBot
 
 
 class DirectMessagesCog(commands.Cog):
-    def __init__(self, bot: "InterpolBot") -> None:
+    def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
 
     @commands.Cog.listener()

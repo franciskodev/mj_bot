@@ -10,11 +10,11 @@ from config import GUILD_ID, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import InterpolBot
+    from bot import IntoleranceBot
 
 
 class ActivityCog(commands.Cog):
-    def __init__(self, bot: "InterpolBot") -> None:
+    def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
         self.voice_sessions: dict[int, int] = {}
         self.automated_role_removals: set[int] = set()
@@ -216,7 +216,7 @@ class ActivityCog(commands.Cog):
                 value="💬 Минимум одно сообщение\n🎙️ Минимум 30 минут в voice",
                 inline=False,
             )
-            embed.set_footer(text="INTERPOL • Контроль активности")
+            embed.set_footer(text="INTOLERANCE • Контроль активности")
 
             delivered = True
             try:

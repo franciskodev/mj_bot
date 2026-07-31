@@ -25,7 +25,7 @@ async def send_admin_log(
     embed = disnake.Embed(
         title=title, description=description, color=color, timestamp=disnake.utils.utcnow()
     )
-    embed.set_footer(text="INTERPOL • Журнал действий")
+    embed.set_footer(text="INTOLERANCE • Журнал действий")
     try:
         await channel.send(embed=embed)
     except disnake.DiscordException:

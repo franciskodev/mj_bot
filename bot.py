@@ -13,7 +13,7 @@ from cogs.users import UsersCog
 from database import Database
 
 
-class InterpolBot(commands.InteractionBot):
+class IntoleranceBot(commands.InteractionBot):
     def __init__(self) -> None:
         intents = disnake.Intents.default()
         intents.message_content = True

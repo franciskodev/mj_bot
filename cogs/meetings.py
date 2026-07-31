@@ -8,7 +8,7 @@ from disnake.ext import commands
 from config import ADMIN_LOG_CHANNEL_ID, GUILD_ID, TARGET_ROLE_IDS
 
 if TYPE_CHECKING:
-    from bot import InterpolBot
+    from bot import IntoleranceBot
 
 
 PAGE_TEXT_LIMIT = 3500
@@ -74,7 +74,7 @@ def build_meeting_pages(
             color=color,
             timestamp=disnake.utils.utcnow(),
         )
-        embed.set_footer(text=f"INTERPOL • Страница {index}/{total}")
+        embed.set_footer(text=f"INTOLERANCE • Страница {index}/{total}")
         pages.append(embed)
     return pages
 
@@ -120,7 +120,7 @@ class MeetingPaginator(disnake.ui.View):
 
 
 class MeetingsCog(commands.Cog):
-    def __init__(self, bot: "InterpolBot") -> None:
+    def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
 
     @commands.slash_command(

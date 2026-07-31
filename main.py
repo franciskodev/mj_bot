@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from bot import InterpolBot
+from bot import IntoleranceBot
 from config import DISCORD_TOKEN
 
 
@@ -15,7 +15,7 @@ async def run_bot() -> None:
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is missing. Create .env and add your bot token.")
 
-    bot = InterpolBot()
+    bot = IntoleranceBot()
     await bot.database.connect()
 
     try:
