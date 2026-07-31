@@ -7,11 +7,11 @@ After=network-online.target postgresql.service
 Type=simple
 User=francisko
 Group=francisko
-WorkingDirectory=/home/francisko/interpol
-EnvironmentFile=/home/francisko/interpol/.env
+WorkingDirectory=/home/francisko/intolerance
+EnvironmentFile=/home/francisko/intolerance/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/home/francisko/interpol/venv/bin/python /home/francisko/interpol/main.py
+ExecStart=/home/francisko/intolerance/venv/bin/python /home/francisko/intolerance/main.py
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
