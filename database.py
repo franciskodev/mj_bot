@@ -4,7 +4,7 @@ from datetime import datetime
 import asyncpg
 import disnake
 
-from config import DATABASE_URL, TARGET_ROLE_IDS
+from config import DATABASE_URL, GUILD_ID, TARGET_ROLE_IDS
 
 
 class Database:
@@ -46,6 +46,7 @@ class Database:
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS inactive_reason TEXT;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS inactive_at TIMESTAMPTZ;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity_warning_at TIMESTAMPTZ;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS family_name TEXT;
                 UPDATE users SET is_active=FALSE, inactive_reason=COALESCE(inactive_reason, 'Роли сняты за неактивность'),
                     inactive_at=COALESCE(inactive_at, roles_removed_at) WHERE roles_removed_at IS NOT NULL;
                 ALTER TABLE users DROP COLUMN IF EXISTS kicked_at;
@@ -60,6 +61,22 @@ class Database:
                     duration_seconds INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS voice_sessions_user_started_idx ON voice_sessions(discord_id, started_at DESC);
+                CREATE OR REPLACE FUNCTION voice_seconds_since(
+                    target_discord_id BIGINT,
+                    since_at TIMESTAMPTZ
+                ) RETURNS BIGINT LANGUAGE SQL STABLE AS $$
+                    SELECT COALESCE(SUM(EXTRACT(EPOCH FROM(
+                        UPPER(session_range)-LOWER(session_range)
+                    ))), 0)::BIGINT
+                    FROM UNNEST((SELECT RANGE_AGG(TSTZRANGE(
+                        GREATEST(started_at, since_at),
+                        LEAST(COALESCE(ended_at, NOW()), NOW()), '[)'
+                    )) FROM voice_sessions
+                    WHERE discord_id=target_discord_id
+                      AND COALESCE(ended_at, NOW())>since_at
+                      AND started_at<NOW())) AS session_range;
+                $$;
+
 
                 CREATE TABLE IF NOT EXISTS leave_requests (
                     id BIGSERIAL PRIMARY KEY,
@@ -129,14 +146,65 @@ class Database:
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS application_json_path TEXT;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS transcript_path TEXT;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS transcript_saved_at TIMESTAMPTZ;
+                ALTER TABLE applications ADD COLUMN IF NOT EXISTS guild_id BIGINT;
+                ALTER TABLE applications ADD COLUMN IF NOT EXISTS family_name TEXT;
                 CREATE INDEX IF NOT EXISTS applications_user_created_idx
                     ON applications(discord_id, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS application_guild_config (
+                    guild_id BIGINT PRIMARY KEY,
+                    panel_channel_id BIGINT NOT NULL,
+                    category_id BIGINT NOT NULL,
+                    reviewer_role_id BIGINT NOT NULL,
+                    accepted_role_id BIGINT NOT NULL,
+                    panel_message_id BIGINT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                ALTER TABLE application_guild_config
+                    ADD COLUMN IF NOT EXISTS interpolov_role_id BIGINT;
+                ALTER TABLE application_guild_config
+                    ADD COLUMN IF NOT EXISTS intolerance_role_id BIGINT;
                 CREATE TABLE IF NOT EXISTS bot_settings (
                     key TEXT PRIMARY KEY,
                     value TIMESTAMPTZ NOT NULL
                 );
                 """
+            )
+            await connection.execute(
+                "UPDATE applications SET guild_id=$1 WHERE guild_id IS NULL",
+                GUILD_ID,
+            )
+            await connection.execute(
+                "ALTER TABLE applications ALTER COLUMN guild_id SET NOT NULL"
+            )
+            await connection.execute(
+                """UPDATE applications SET family_name='INTOLERANCE'
+                WHERE family_name IS NULL"""
+            )
+            await connection.execute(
+                "ALTER TABLE applications ALTER COLUMN family_name SET NOT NULL"
+            )
+            await connection.execute(
+                """INSERT INTO application_guild_config(
+                    guild_id,panel_channel_id,category_id,reviewer_role_id,
+                    accepted_role_id,panel_message_id,updated_at,
+                    interpolov_role_id,intolerance_role_id
+                ) SELECT $1,panel_channel_id,category_id,
+                    reviewer_role_id,accepted_role_id,panel_message_id,updated_at,
+                    accepted_role_id,accepted_role_id
+                FROM application_config WHERE id=1
+                ON CONFLICT(guild_id) DO NOTHING""",
+                GUILD_ID,
+            )
+            await connection.execute(
+                """UPDATE application_guild_config SET
+                    interpolov_role_id=COALESCE(interpolov_role_id,accepted_role_id),
+                    intolerance_role_id=COALESCE(intolerance_role_id,accepted_role_id)"""
+            )
+            await connection.execute(
+                """ALTER TABLE application_guild_config
+                    ALTER COLUMN interpolov_role_id SET NOT NULL,
+                    ALTER COLUMN intolerance_role_id SET NOT NULL"""
             )
 
         logging.info("Connected to PostgreSQL")
@@ -152,14 +220,19 @@ class Database:
         self.pool = None
         logging.info("PostgreSQL connection pool closed")
 
-    async def save_users(self, users: list[disnake.User | disnake.Member]) -> None:
+    async def save_users(
+        self,
+        users: list[disnake.User | disnake.Member],
+        role_ids: set[int] = TARGET_ROLE_IDS,
+    ) -> None:
         if self.pool is None or not users:
             return
 
         family_members = [
             user for user in users
             if isinstance(user, disnake.Member)
-            and any(role.id in TARGET_ROLE_IDS for role in user.roles)
+            and (user.guild_permissions.administrator
+                or any(role.id in role_ids for role in user.roles))
         ]
         values = [
             (
@@ -206,6 +279,21 @@ class Database:
             discord_id,
         )
 
+    async def set_user_family(
+        self, discord_id: int, family_name: str
+    ) -> asyncpg.Record | None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        if family_name not in {"INTERPOLOV", "INTOLERANCE"}:
+            raise ValueError("Unknown family name")
+
+        return await self.pool.fetchrow(
+            """UPDATE users SET family_name=$2,updated_at=NOW()
+            WHERE discord_id=$1 RETURNING *""",
+            discord_id,
+            family_name,
+        )
+
     async def update_user_profile(
         self,
         discord_id: int,
@@ -229,7 +317,9 @@ class Database:
                 server_name = CASE
                     WHEN $3::TEXT IS NULL THEN server_name ELSE NULLIF($3, '-')
                 END,
-                profile_status = COALESCE($4::TEXT, profile_status),
+                profile_status = CASE
+                    WHEN $7 THEN 'Активен' ELSE COALESCE($4::TEXT, profile_status)
+                END,
                 bio = CASE
                     WHEN $5::TEXT IS NULL THEN bio ELSE NULLIF($5, '-')
                 END,
@@ -279,12 +369,22 @@ class Database:
     async def start_voice_session(self, discord_id: int, channel_id: int) -> int | None:
         if self.pool is None:
             return None
-        return await self.pool.fetchval(
-            """INSERT INTO voice_sessions(discord_id,channel_id)
-            SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM users WHERE discord_id=$1 AND is_active=TRUE) RETURNING id""",
-            discord_id, channel_id,
-        )
-
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute("SELECT pg_advisory_xact_lock($1)", discord_id)
+                session_id = await connection.fetchval(
+                    """SELECT id FROM voice_sessions
+                    WHERE discord_id=$1 AND ended_at IS NULL
+                    ORDER BY started_at DESC LIMIT 1""", discord_id,
+                )
+                if session_id is not None:
+                    return session_id
+                return await connection.fetchval(
+                    """INSERT INTO voice_sessions(discord_id,channel_id)
+                    SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM users
+                    WHERE discord_id=$1 AND is_active=TRUE) RETURNING id""",
+                    discord_id, channel_id,
+                )
     async def end_voice_session(self, session_id: int) -> None:
         if self.pool is not None:
             await self.pool.execute(
@@ -297,9 +397,15 @@ class Database:
         if self.pool is None:
             return 0
         value = await self.pool.fetchval(
-            """SELECT COALESCE(SUM(EXTRACT(EPOCH FROM(LEAST(COALESCE(ended_at,NOW()),NOW())
-            -GREATEST(started_at,NOW()-INTERVAL '7 days')))),0) FROM voice_sessions
-            WHERE discord_id=$1 AND COALESCE(ended_at,NOW())>NOW()-INTERVAL '7 days'""", discord_id,
+            "SELECT voice_seconds_since($1, NOW()-INTERVAL '7 days')", discord_id,
+        )
+        return int(value)
+
+    async def get_total_voice_seconds(self, discord_id: int) -> int:
+        if self.pool is None:
+            return 0
+        value = await self.pool.fetchval(
+            "SELECT voice_seconds_since($1, '-infinity'::TIMESTAMPTZ)", discord_id,
         )
         return int(value)
 
@@ -335,16 +441,16 @@ class Database:
         WHERE profile_status='В отпуске' AND NOT EXISTS(SELECT 1 FROM leave_requests l
         WHERE l.discord_id=u.discord_id AND l.status='approved' AND l.ends_at>NOW())""")
         return await self.pool.fetch(
-            """SELECT u.*,COALESCE((SELECT SUM(EXTRACT(EPOCH FROM(LEAST(COALESCE(v.ended_at,NOW()),NOW())
-            -GREATEST(v.started_at,NOW()-INTERVAL '7 days')))) FROM voice_sessions v WHERE v.discord_id=u.discord_id
-            AND COALESCE(v.ended_at,NOW())>NOW()-INTERVAL '7 days'),0)::INTEGER AS weekly_voice_seconds
+            """SELECT u.*, voice_seconds_since(
+                u.discord_id, NOW()-INTERVAL '7 days'
+            )::INTEGER AS weekly_voice_seconds
             FROM users u WHERE COALESCE(u.guild_joined_at,u.created_at)<=NOW()-INTERVAL '7 days'
-            AND u.is_active=TRUE AND NOT EXISTS(SELECT 1 FROM leave_requests l WHERE l.discord_id=u.discord_id
-            AND l.status='approved' AND l.ends_at>NOW()) AND(
-            COALESCE(u.last_message_at,u.guild_joined_at,u.created_at)<NOW()-INTERVAL '7 days' OR
-            COALESCE((SELECT SUM(EXTRACT(EPOCH FROM(LEAST(COALESCE(v.ended_at,NOW()),NOW())
-            -GREATEST(v.started_at,NOW()-INTERVAL '7 days')))) FROM voice_sessions v WHERE v.discord_id=u.discord_id
-            AND COALESCE(v.ended_at,NOW())>NOW()-INTERVAL '7 days'),0)<3600)"""
+            AND u.is_active=TRUE AND NOT EXISTS(SELECT 1 FROM leave_requests l
+            WHERE l.discord_id=u.discord_id AND l.status='approved' AND l.ends_at>NOW())
+            AND (COALESCE(u.last_message_at,u.guild_joined_at,u.created_at)
+                <NOW()-INTERVAL '7 days' OR voice_seconds_since(
+                    u.discord_id, NOW()-INTERVAL '7 days'
+                )<3600)"""
         )
 
     async def has_pending_leave(self, discord_id: int) -> bool:
@@ -355,12 +461,13 @@ class Database:
             discord_id,
         ))
 
-    async def get_activity_enforcement_started_at(self) -> datetime:
+    async def get_activity_enforcement_started_at(self, guild_id: int) -> datetime:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
         return await self.pool.fetchval(
-            """INSERT INTO bot_settings(key,value) VALUES('activity_enforcement_started_at',NOW())
-            ON CONFLICT(key) DO UPDATE SET value=bot_settings.value RETURNING value"""
+            """INSERT INTO bot_settings(key,value) VALUES($1,NOW())
+            ON CONFLICT(key) DO UPDATE SET value=bot_settings.value RETURNING value""",
+            f"activity_enforcement_started_at:{guild_id}",
         )
 
     async def record_meeting_attendance(
@@ -400,35 +507,32 @@ class Database:
                 )
                 return meeting_id, list(rows)
 
-    async def get_daily_warning_started_at(self) -> datetime:
+    async def get_daily_warning_started_at(self, guild_id: int) -> datetime:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
         return await self.pool.fetchval(
-            """INSERT INTO bot_settings(key,value) VALUES('daily_warning_started_at',NOW())
-            ON CONFLICT(key) DO UPDATE SET value=bot_settings.value RETURNING value"""
+            """INSERT INTO bot_settings(key,value) VALUES($1,NOW())
+            ON CONFLICT(key) DO UPDATE SET value=bot_settings.value RETURNING value""",
+            f"daily_warning_started_at:{guild_id}",
         )
 
     async def get_daily_warning_users(self) -> list[asyncpg.Record]:
         if self.pool is None:
             return []
         return await self.pool.fetch(
-            """SELECT u.*,COALESCE((SELECT SUM(EXTRACT(EPOCH FROM(
-            LEAST(COALESCE(v.ended_at,NOW()),NOW())
-            -GREATEST(v.started_at,NOW()-INTERVAL '24 hours'))))
-            FROM voice_sessions v WHERE v.discord_id=u.discord_id
-            AND COALESCE(v.ended_at,NOW())>NOW()-INTERVAL '24 hours'),0)::INTEGER
-            AS daily_voice_seconds FROM users u WHERE u.is_active=TRUE
+            """SELECT u.*, voice_seconds_since(
+                u.discord_id, NOW()-INTERVAL '24 hours'
+            )::INTEGER AS daily_voice_seconds
+            FROM users u WHERE u.is_active=TRUE
             AND NOT EXISTS(SELECT 1 FROM leave_requests l WHERE l.discord_id=u.discord_id
                 AND l.status='approved' AND l.ends_at>NOW())
             AND COALESCE(u.guild_joined_at,u.created_at)<=NOW()-INTERVAL '24 hours'
             AND (u.last_activity_warning_at IS NULL
                 OR u.last_activity_warning_at<=NOW()-INTERVAL '24 hours')
             AND (COALESCE(u.last_message_at,u.guild_joined_at,u.created_at)
-                <NOW()-INTERVAL '24 hours' OR COALESCE((SELECT SUM(EXTRACT(EPOCH FROM(
-                    LEAST(COALESCE(v.ended_at,NOW()),NOW())
-                    -GREATEST(v.started_at,NOW()-INTERVAL '24 hours'))))
-                    FROM voice_sessions v WHERE v.discord_id=u.discord_id
-                    AND COALESCE(v.ended_at,NOW())>NOW()-INTERVAL '24 hours'),0)<1800)"""
+                <NOW()-INTERVAL '24 hours' OR voice_seconds_since(
+                    u.discord_id, NOW()-INTERVAL '24 hours'
+                )<1800)"""
         )
 
     async def record_activity_warning(
@@ -453,48 +557,58 @@ class Database:
 
     async def save_application_config(
         self,
+        guild_id: int,
         panel_channel_id: int,
         category_id: int,
         reviewer_role_id: int,
-        accepted_role_id: int,
+        interpolov_role_id: int,
+        intolerance_role_id: int,
     ) -> None:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
         await self.pool.execute(
-            """INSERT INTO application_config(
-                id,panel_channel_id,category_id,reviewer_role_id,accepted_role_id
-            ) VALUES(1,$1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET
+            """INSERT INTO application_guild_config(
+                guild_id,panel_channel_id,category_id,reviewer_role_id,
+                accepted_role_id,interpolov_role_id,intolerance_role_id
+            ) VALUES($1,$2,$3,$4,$6,$5,$6) ON CONFLICT(guild_id) DO UPDATE SET
                 panel_channel_id=EXCLUDED.panel_channel_id,
                 category_id=EXCLUDED.category_id,
                 reviewer_role_id=EXCLUDED.reviewer_role_id,
                 accepted_role_id=EXCLUDED.accepted_role_id,
+                interpolov_role_id=EXCLUDED.interpolov_role_id,
+                intolerance_role_id=EXCLUDED.intolerance_role_id,
                 updated_at=NOW()""",
-            panel_channel_id, category_id, reviewer_role_id, accepted_role_id,
+            guild_id, panel_channel_id, category_id, reviewer_role_id,
+            interpolov_role_id, intolerance_role_id,
         )
 
-    async def set_application_panel_message(self, message_id: int) -> None:
+    async def set_application_panel_message(self, guild_id: int, message_id: int) -> None:
         if self.pool is not None:
             await self.pool.execute(
-                "UPDATE application_config SET panel_message_id=$1,updated_at=NOW() WHERE id=1",
-                message_id,
+                "UPDATE application_guild_config SET panel_message_id=$2,updated_at=NOW() WHERE guild_id=$1",
+                guild_id, message_id,
             )
 
-    async def get_application_config(self) -> asyncpg.Record | None:
+    async def get_application_config(self, guild_id: int) -> asyncpg.Record | None:
         if self.pool is None:
             return None
-        return await self.pool.fetchrow("SELECT * FROM application_config WHERE id=1")
+        return await self.pool.fetchrow(
+            "SELECT * FROM application_guild_config WHERE guild_id=$1", guild_id
+        )
 
-    async def has_open_application(self, discord_id: int) -> bool:
+    async def has_open_application(self, discord_id: int, guild_id: int) -> bool:
         if self.pool is None:
             return False
         return bool(await self.pool.fetchval(
             """SELECT EXISTS(SELECT 1 FROM applications WHERE discord_id=$1
-            AND status IN('pending','review','interview'))""",
-            discord_id,
+            AND guild_id=$2 AND status IN('pending','review','interview'))""",
+            discord_id, guild_id,
         ))
 
     async def create_application(
         self,
+        guild_id: int,
+        family_name: str,
         discord_id: int,
         username: str,
         game_nickname: str,
@@ -507,9 +621,10 @@ class Database:
             raise RuntimeError("Database is not connected")
         return await self.pool.fetchrow(
             """INSERT INTO applications(
-                discord_id,username,game_nickname,static_id,ooc_age,goal,screenshot_url
-            ) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *""",
-            discord_id, username, game_nickname, static_id, ooc_age, goal, screenshot_url,
+                guild_id,family_name,discord_id,username,game_nickname,static_id,ooc_age,goal,screenshot_url
+            ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *""",
+            guild_id, family_name, discord_id, username, game_nickname, static_id,
+            ooc_age, goal, screenshot_url,
         )
 
     async def set_application_ticket(

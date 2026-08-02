@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -5,7 +6,7 @@ import asyncpg
 import disnake
 from disnake.ext import commands
 
-from config import GUILD_ID, TARGET_ROLE_IDS
+from config import GUILD_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -25,7 +26,12 @@ def format_date(value: datetime | None) -> str:
     return f"<t:{int(value.timestamp())}:F>"
 
 
-def profile_embed(user: disnake.User | disnake.Member, profile: asyncpg.Record, voice_seconds: int | None = None) -> disnake.Embed:
+def profile_embed(
+    user: disnake.User | disnake.Member,
+    profile: asyncpg.Record,
+    weekly_voice_seconds: int | None = None,
+    total_voice_seconds: int | None = None,
+) -> disnake.Embed:
     status = profile["profile_status"]
     embed = disnake.Embed(
         title="Профиль участника",
@@ -35,6 +41,7 @@ def profile_embed(user: disnake.User | disnake.Member, profile: asyncpg.Record, 
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="🎮 Игровой ник", value=profile["game_nickname"] or "—", inline=True)
     embed.add_field(name="🌐 Сервер", value=profile["server_name"] or "—", inline=True)
+    embed.add_field(name="🤝 Семья", value=profile["family_name"] or "—", inline=True)
     embed.add_field(name="📌 Статус", value=status, inline=True)
     if not profile["is_active"]:
         embed.add_field(
@@ -42,10 +49,14 @@ def profile_embed(user: disnake.User | disnake.Member, profile: asyncpg.Record, 
             value=profile["inactive_reason"] or "Причина не указана",
             inline=False,
         )
-    if voice_seconds is not None:
-        hours, remainder = divmod(voice_seconds, 3600)
+    if weekly_voice_seconds is not None:
+        hours, remainder = divmod(weekly_voice_seconds, 3600)
         minutes = remainder // 60
         embed.add_field(name="🎙️ Войс за 7 дней", value=f"`{hours} ч. {minutes} мин.`", inline=True)
+    if total_voice_seconds is not None:
+        hours, remainder = divmod(total_voice_seconds, 3600)
+        minutes = remainder // 60
+        embed.add_field(name="🎙️ Войс за всё время", value=f"`{hours} ч. {minutes} мин.`", inline=True)
     embed.add_field(name="🆔 Discord ID", value=f"`{user.id}`", inline=True)
     embed.add_field(name="👤 Discord", value=f"`{user}`", inline=True)
     embed.add_field(
@@ -53,7 +64,7 @@ def profile_embed(user: disnake.User | disnake.Member, profile: asyncpg.Record, 
         value=format_date(profile["guild_joined_at"]),
         inline=False,
     )
-    embed.set_footer(text="INTOLERANCE • Профиль участника")
+    embed.set_footer(text="INTERPOLOV & INTOLERANCE • Профиль участника")
     return embed
 
 
@@ -99,12 +110,17 @@ class ServerSelect(disnake.ui.StringSelect):
         profile = await self.bot.database.update_user_profile(
             self.owner_id, server_name=server_name
         )
-        voice_seconds = await self.bot.database.get_weekly_voice_seconds(self.owner_id)
+        weekly_voice_seconds, total_voice_seconds = await asyncio.gather(
+            self.bot.database.get_weekly_voice_seconds(self.owner_id),
+            self.bot.database.get_total_voice_seconds(self.owner_id),
+        )
         for option in self.options:
             option.default = option.value in self.values
         await inter.response.edit_message(
             content=f"✅ Сервер обновлён: **{server_name}**",
-            embed=profile_embed(self.profile_owner, profile, voice_seconds) if profile else None,
+            embed=profile_embed(
+                self.profile_owner, profile, weekly_voice_seconds, total_voice_seconds
+            ) if profile else None,
             view=self.view,
         )
 
@@ -128,7 +144,7 @@ class UsersCog(commands.Cog):
     @commands.slash_command(
         name="myinfo",
         description="Показать ваш профиль",
-        guild_ids=[GUILD_ID],
+        guild_ids=GUILD_IDS,
     )
     async def myinfo(self, inter: disnake.ApplicationCommandInteraction) -> None:
         profile = await self.bot.database.get_user(inter.author.id)
@@ -148,9 +164,14 @@ class UsersCog(commands.Cog):
             )
             return
 
-        voice_seconds = await self.bot.database.get_weekly_voice_seconds(inter.author.id)
+        weekly_voice_seconds, total_voice_seconds = await asyncio.gather(
+            self.bot.database.get_weekly_voice_seconds(inter.author.id),
+            self.bot.database.get_total_voice_seconds(inter.author.id),
+        )
         await inter.response.send_message(
-            embed=profile_embed(inter.author, profile, voice_seconds),
+            embed=profile_embed(
+                inter.author, profile, weekly_voice_seconds, total_voice_seconds
+            ),
             view=UserServerView(self.bot, inter.author, profile["server_name"]),
             ephemeral=True,
         )
@@ -158,7 +179,7 @@ class UsersCog(commands.Cog):
     @commands.slash_command(
         name="user",
         description="Управление профилями пользователей",
-        guild_ids=[GUILD_ID],
+        guild_ids=GUILD_IDS,
         default_member_permissions=disnake.Permissions(administrator=True),
     )
     async def user(self, inter: disnake.ApplicationCommandInteraction) -> None:
@@ -170,17 +191,34 @@ class UsersCog(commands.Cog):
         self,
         inter: disnake.ApplicationCommandInteraction,
         member: disnake.Member = commands.Param(description="Участник Discord"),
+        family: str = commands.Param(
+            description="Семья участника",
+            choices=["INTERPOLOV", "INTOLERANCE"],
+        ),
         nickname: str = commands.Param(description="Игровой ник", max_length=100),
         server: str | None = commands.Param(default=None, description="Игровой сервер", max_length=100),
         bio: str | None = commands.Param(default=None, description="Описание профиля", max_length=500),
     ) -> None:
-        if not any(role.id in TARGET_ROLE_IDS for role in member.roles):
+        config = await self.bot.database.get_application_config(inter.guild_id) if inter.guild_id else None
+        if config is None:
             await inter.response.send_message(
-                "Пользователь не имеет семейной роли и не может быть добавлен в базу.",
+                "Сначала настройте семейные роли командой `/applications setup`.",
                 ephemeral=True,
             )
             return
-        await self.bot.database.save_users([member])
+        role_id = config[
+            "interpolov_role_id" if family == "INTERPOLOV" else "intolerance_role_id"
+        ]
+        family_role_ids = {config["interpolov_role_id"], config["intolerance_role_id"]}
+        if not member.guild_permissions.administrator and not any(
+            role.id == role_id for role in member.roles
+        ):
+            await inter.response.send_message(
+                f"У пользователя нет роли семьи **{family}**.",
+                ephemeral=True,
+            )
+            return
+        await self.bot.database.save_users([member], role_ids=family_role_ids)
         profile = await self.bot.database.update_user_profile(
             member.id,
             game_nickname=nickname,
@@ -189,6 +227,7 @@ class UsersCog(commands.Cog):
             added_by=inter.author.id,
             reactivate=True,
         )
+        profile = await self.bot.database.set_user_family(member.id, family)
         await inter.response.send_message(
             content=f"✅ Профиль {member.mention} добавлен или обновлён.",
             embed=profile_embed(member, profile) if profile else None,
@@ -245,7 +284,16 @@ class UsersCog(commands.Cog):
             await inter.response.send_message("Пользователь отсутствует в базе.", ephemeral=True)
             return
 
-        await inter.response.send_message(embed=profile_embed(member, profile), ephemeral=True)
+        weekly_voice_seconds, total_voice_seconds = await asyncio.gather(
+            self.bot.database.get_weekly_voice_seconds(member.id),
+            self.bot.database.get_total_voice_seconds(member.id),
+        )
+        await inter.response.send_message(
+            embed=profile_embed(
+                member, profile, weekly_voice_seconds, total_voice_seconds
+            ),
+            ephemeral=True,
+        )
         await send_admin_log(self.bot, title="🔎 Просмотр профиля", description=f"Администратор: {inter.author.mention}\nПользователь: {member.mention} (`{member.id}`)")
 
     @user.sub_command(name="remove", description="Удалить пользователя из базы данных")

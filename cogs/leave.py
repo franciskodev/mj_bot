@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 import disnake
 from disnake.ext import commands
 
-from config import ADMIN_LOG_CHANNEL_ID, GUILD_ID
+from config import ADMIN_LOG_CHANNEL_ID, GUILD_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -15,7 +15,7 @@ class LeaveCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
 
-    @commands.slash_command(name="leave", description="Управление отпуском", guild_ids=[GUILD_ID])
+    @commands.slash_command(name="leave", description="Управление отпуском", guild_ids=GUILD_IDS)
     async def leave(self, inter: disnake.ApplicationCommandInteraction) -> None:
         pass
 
@@ -57,12 +57,13 @@ class LeaveCog(commands.Cog):
             timestamp=disnake.utils.utcnow(),
         )
         embed.set_thumbnail(url=inter.author.display_avatar.url)
+        embed.add_field(name="🏠 Сервер-источник", value=f"**{inter.guild.name}**\n`{inter.guild_id}`" if inter.guild else "—", inline=False)
         embed.add_field(name="🎮 Игровой ник", value=profile["game_nickname"] or "—", inline=True)
         embed.add_field(name="🌐 Сервер", value=profile["server_name"] or "—", inline=True)
         embed.add_field(name="📆 Срок", value=f"**{days}** дн.\nДо <t:{int(request['ends_at'].timestamp())}:D>", inline=True)
         embed.add_field(name="📝 Причина", value=reason, inline=False)
         embed.add_field(name="🆔 Discord ID", value=f"`{inter.author.id}`", inline=True)
-        embed.set_footer(text=f"INTOLERANCE • Заявка #{request['id']}")
+        embed.set_footer(text=f"INTERPOLOV & INTOLERANCE • Заявка #{request['id']}")
         components = [
             disnake.ui.Button(label="Одобрить", emoji="✅", style=disnake.ButtonStyle.success, custom_id=f"leave:approved:{request['id']}"),
             disnake.ui.Button(label="Отклонить", emoji="✖️", style=disnake.ButtonStyle.danger, custom_id=f"leave:declined:{request['id']}"),

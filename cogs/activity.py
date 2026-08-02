@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import disnake
 from disnake.ext import commands, tasks
 
-from config import GUILD_ID, TARGET_ROLE_IDS
+from config import ALLOWED_GUILD_IDS, GUILD_ID, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -20,26 +20,53 @@ class ActivityCog(commands.Cog):
         self.automated_role_removals: set[int] = set()
         self.check_inactive.start()
         self.check_daily_warnings.start()
+        self.check_family_roles.start()
 
     def cog_unload(self) -> None:
         self.check_inactive.cancel()
         self.check_daily_warnings.cancel()
+        self.check_family_roles.cancel()
+
+    async def get_family_role_ids(self) -> set[int]:
+        role_ids = set(TARGET_ROLE_IDS)
+        config = await self.bot.database.get_application_config(GUILD_ID)
+        if config is not None:
+            role_ids.update(
+                {config["interpolov_role_id"], config["intolerance_role_id"]}
+            )
+        return role_ids
+    async def sync_member_family(self, member: disnake.Member) -> None:
+        config = await self.bot.database.get_application_config(member.guild.id)
+        if config is None:
+            return
+        member_role_ids = {role.id for role in member.roles}
+        families = [
+            family_name
+            for family_name, role_id in (
+                ("INTERPOLOV", config["interpolov_role_id"]),
+                ("INTOLERANCE", config["intolerance_role_id"]),
+            )
+            if role_id in member_role_ids
+        ]
+        if len(families) == 1:
+            await self.bot.database.set_user_family(member.id, families[0])
+
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        guild = self.bot.get_guild(GUILD_ID)
-        if guild is None:
-            return
-        for channel in guild.voice_channels:
-            for member in channel.members:
-                if not member.bot and member.id not in self.voice_sessions:
-                    session_id = await self.bot.database.start_voice_session(member.id, channel.id)
-                    if session_id is not None:
-                        self.voice_sessions[member.id] = session_id
+        for guild in self.bot.guilds:
+            if guild.id not in ALLOWED_GUILD_IDS:
+                continue
+            for channel in guild.voice_channels:
+                for member in channel.members:
+                    if not member.bot and member.id not in self.voice_sessions:
+                        session_id = await self.bot.database.start_voice_session(member.id, channel.id)
+                        if session_id is not None:
+                            self.voice_sessions[member.id] = session_id
 
     @commands.Cog.listener()
     async def on_message(self, message: disnake.Message) -> None:
-        if message.author.bot or message.guild is None or message.guild.id != GUILD_ID:
+        if message.author.bot or message.guild is None or message.guild.id not in ALLOWED_GUILD_IDS:
             return
         await self.bot.database.record_message_activity(message.author.id)
 
@@ -50,7 +77,7 @@ class ActivityCog(commands.Cog):
         before: disnake.VoiceState,
         after: disnake.VoiceState,
     ) -> None:
-        if member.bot or member.guild.id != GUILD_ID:
+        if member.bot or member.guild.id not in ALLOWED_GUILD_IDS:
             return
         if before.channel is None and after.channel is not None:
             session_id = await self.bot.database.start_voice_session(member.id, after.channel.id)
@@ -69,8 +96,35 @@ class ActivityCog(commands.Cog):
     ) -> None:
         if after.guild.id != GUILD_ID or after.id in self.automated_role_removals:
             return
-        before_family_roles = [role for role in before.roles if role.id in TARGET_ROLE_IDS]
-        after_family_roles = [role for role in after.roles if role.id in TARGET_ROLE_IDS]
+        family_role_ids = await self.get_family_role_ids()
+        before_family_roles = [role for role in before.roles if role.id in family_role_ids]
+        after_family_roles = [role for role in after.roles if role.id in family_role_ids]
+        await self.sync_member_family(after)
+
+        if not before_family_roles and after_family_roles:
+            await self.bot.database.save_users([after], role_ids=family_role_ids)
+            profile = await self.bot.database.update_user_profile(
+                after.id,
+                profile_status="Активен",
+                reactivate=True,
+            )
+            await self.sync_member_family(after)
+            if profile is not None:
+                returned_roles = ", ".join(role.name for role in after_family_roles)
+                await send_admin_log(
+                    self.bot,
+                    title="✅ Пользователь реактивирован",
+                    description=(
+                        f"Пользователь: {after.mention} (`{after.id}`)\n"
+                        f"Возвращённые семейные роли: **{returned_roles}**"
+                    ),
+                    color=disnake.Color.green(),
+                )
+            return
+
+        if after.guild_permissions.administrator:
+            return
+
         if not before_family_roles or after_family_roles:
             return
 
@@ -100,8 +154,9 @@ class ActivityCog(commands.Cog):
             return
         reason = "Пользователь покинул сервер"
         await self.bot.database.deactivate_user(member.id, reason)
+        family_role_ids = await self.get_family_role_ids()
         was_family_member = profile["is_active"] and any(
-            role.id in TARGET_ROLE_IDS for role in member.roles
+            role.id in family_role_ids for role in member.roles
         )
         if not was_family_member:
             return
@@ -116,12 +171,77 @@ class ActivityCog(commands.Cog):
             color=disnake.Color.red(),
         )
 
+    @tasks.loop(minutes=5)
+    async def check_family_roles(self) -> None:
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+
+        family_role_ids = await self.get_family_role_ids()
+        if not family_role_ids:
+            return
+
+        for member in guild.members:
+            if member.bot or (not member.guild_permissions.administrator and not any(
+                role.id in family_role_ids for role in member.roles
+            )):
+                continue
+            profile = await self.bot.database.get_user(member.id)
+            if profile is not None and profile["is_active"]:
+                await self.sync_member_family(member)
+                continue
+
+            await self.bot.database.save_users([member], role_ids=family_role_ids)
+            profile = await self.bot.database.update_user_profile(
+                member.id,
+                profile_status="Активен",
+                reactivate=True,
+            )
+            await self.sync_member_family(member)
+            if profile is not None:
+                await send_admin_log(
+                    self.bot,
+                    title="✅ Пользователь реактивирован",
+                    description=(
+                        f"Пользователь: {member.mention} (`{member.id}`)\n"
+                        f"Причина: **{'права администратора' if member.guild_permissions.administrator else 'семейная роль обнаружена при плановой проверке'}**"
+                    ),
+                    color=disnake.Color.green(),
+                )
+
+        for profile in await self.bot.database.get_active_users():
+            member = guild.get_member(profile["discord_id"])
+            if member is None or member.bot:
+                continue
+            if member.guild_permissions.administrator or any(
+                role.id in family_role_ids for role in member.roles
+            ):
+                continue
+
+            changed = await self.bot.database.deactivate_user(
+                member.id,
+                "Семейная роль отсутствует при плановой проверке",
+                roles_removed=True,
+            )
+            if changed:
+                await send_admin_log(
+                    self.bot,
+                    title="🧹 Пользователь деактивирован",
+                    description=(
+                        f"Пользователь: {member.mention} (`{member.id}`)\n"
+                        "Причина: **семейная роль отсутствует при плановой проверке**"
+                    ),
+                    color=disnake.Color.red(),
+                )
+
     @tasks.loop(minutes=1)
     async def check_inactive(self) -> None:
         guild = self.bot.get_guild(GUILD_ID)
         if guild is None:
             return
-        enforcement_started_at = await self.bot.database.get_activity_enforcement_started_at()
+        enforcement_started_at = await self.bot.database.get_activity_enforcement_started_at(
+            GUILD_ID
+        )
         if disnake.utils.utcnow() < enforcement_started_at + timedelta(days=7):
             return
         for profile in await self.bot.database.get_inactive_users():
@@ -179,7 +299,7 @@ class ActivityCog(commands.Cog):
         guild = self.bot.get_guild(GUILD_ID)
         if guild is None:
             return
-        started_at = await self.bot.database.get_daily_warning_started_at()
+        started_at = await self.bot.database.get_daily_warning_started_at(GUILD_ID)
         if disnake.utils.utcnow() < started_at + timedelta(days=1):
             return
 
@@ -216,7 +336,7 @@ class ActivityCog(commands.Cog):
                 value="💬 Минимум одно сообщение\n🎙️ Минимум 30 минут в voice",
                 inline=False,
             )
-            embed.set_footer(text="INTOLERANCE • Контроль активности")
+            embed.set_footer(text="INTERPOLOV & INTOLERANCE • Контроль активности")
 
             delivered = True
             try:
@@ -235,3 +355,7 @@ class ActivityCog(commands.Cog):
     async def before_inactive_check(self) -> None:
         await self.bot.wait_until_ready()
         await asyncio.sleep(60)
+
+    @check_family_roles.before_loop
+    async def before_family_roles_check(self) -> None:
+        await self.bot.wait_until_ready()

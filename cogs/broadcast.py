@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import disnake
 from disnake.ext import commands
 
-from config import GUILD_ID, TARGET_ROLE_IDS
+from config import BROADCAST_GUILD_IDS, BROADCAST_ROLE_IDS, GUILD_ID, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -113,16 +113,24 @@ class BroadcastCog(commands.Cog):
         if self.broadcast_task is not None:
             self.broadcast_task.cancel()
 
-    def get_recipients(self) -> list[disnake.Member]:
-        guild = self.bot.get_guild(GUILD_ID)
+    async def get_recipients(self, guild_id: int) -> list[disnake.Member]:
+        guild = self.bot.get_guild(guild_id)
         if guild is None:
-            raise RuntimeError(f"Guild {GUILD_ID} is not available.")
+            raise RuntimeError(f"Guild {guild_id} is not available.")
 
+        role_ids = set(BROADCAST_ROLE_IDS.get(guild_id, set()))
+        if guild_id == GUILD_ID:
+            role_ids.update(TARGET_ROLE_IDS)
+            config = await self.bot.database.get_application_config(GUILD_ID)
+            if config is not None:
+                role_ids.update(
+                    {config["interpolov_role_id"], config["intolerance_role_id"]}
+                )
         members: set[disnake.Member] = set()
-        for role_id in TARGET_ROLE_IDS:
+        for role_id in role_ids:
             role = guild.get_role(role_id)
             if role is None:
-                logging.warning("Role %s was not found in guild %s", role_id, GUILD_ID)
+                logging.warning("Role %s was not found in guild %s", role_id, guild_id)
                 continue
 
             members.update(member for member in role.members if not member.bot)
@@ -184,7 +192,7 @@ class BroadcastCog(commands.Cog):
     @commands.slash_command(
         name="broadcast",
         description="Отправить сообщение пользователям с целевыми ролями",
-        guild_ids=[GUILD_ID],
+        guild_ids=BROADCAST_GUILD_IDS,
         default_member_permissions=disnake.Permissions(administrator=True),
     )
     @commands.has_permissions(administrator=True)
@@ -203,7 +211,9 @@ class BroadcastCog(commands.Cog):
             )
             return
 
-        members = self.get_recipients()
+        if inter.guild_id is None:
+            return
+        members = await self.get_recipients(inter.guild_id)
         if not members:
             await inter.response.send_message(
                 "Не найдено пользователей с целевыми ролями.",

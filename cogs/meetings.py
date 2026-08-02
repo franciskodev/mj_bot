@@ -5,7 +5,7 @@ import asyncpg
 import disnake
 from disnake.ext import commands
 
-from config import ADMIN_LOG_CHANNEL_ID, GUILD_ID, TARGET_ROLE_IDS
+from config import ADMIN_LOG_CHANNEL_ID, GUILD_IDS, TARGET_ROLE_IDS
 
 if TYPE_CHECKING:
     from bot import IntoleranceBot
@@ -74,7 +74,7 @@ def build_meeting_pages(
             color=color,
             timestamp=disnake.utils.utcnow(),
         )
-        embed.set_footer(text=f"INTOLERANCE • Страница {index}/{total}")
+        embed.set_footer(text=f"INTERPOLOV & INTOLERANCE • Страница {index}/{total}")
         pages.append(embed)
     return pages
 
@@ -126,7 +126,7 @@ class MeetingsCog(commands.Cog):
     @commands.slash_command(
         name="meeting",
         description="Управление собраниями семьи",
-        guild_ids=[GUILD_ID],
+        guild_ids=GUILD_IDS,
         default_member_permissions=disnake.Permissions(administrator=True),
     )
     async def meeting(self, inter: disnake.ApplicationCommandInteraction) -> None:
@@ -142,12 +142,18 @@ class MeetingsCog(commands.Cog):
         ),
     ) -> None:
         await inter.response.defer(ephemeral=True)
+        config = await self.bot.database.get_application_config(inter.guild_id)
+        family_role_ids = set(TARGET_ROLE_IDS)
+        if config is not None:
+            family_role_ids.update(
+                {config["interpolov_role_id"], config["intolerance_role_id"]}
+            )
         present_ids = [member.id for member in channel.members if not member.bot]
         family_ids = [
             member.id
             for member in channel.guild.members
             if not member.bot
-            and any(role.id in TARGET_ROLE_IDS for role in member.roles)
+            and any(role.id in family_role_ids for role in member.roles)
         ]
         meeting_id, attendance = await self.bot.database.record_meeting_attendance(
             channel.id, inter.author.id, present_ids, family_ids

@@ -7,7 +7,7 @@ import asyncpg
 import disnake
 from disnake.ext import commands
 
-from config import APPLICATION_LOG_CHANNEL_ID, GUILD_ID, TARGET_ROLE_IDS
+from config import APPLICATION_LOG_CHANNEL_ID, GUILD_IDS
 from log_utils import send_admin_log
 from transcript import save_application_json, save_ticket_transcript
 
@@ -21,6 +21,10 @@ STATUS_NAMES = {
     "interview": "Вызван на обзвон",
     "accepted": "Принят",
     "declined": "Отклонён",
+}
+FAMILY_NAMES = {
+    "interpolov": "INTERPOLOV",
+    "intolerance": "INTOLERANCE",
 }
 
 
@@ -39,15 +43,19 @@ def application_embed(
     previous: list[asyncpg.Record],
 ) -> disnake.Embed:
     embed = disnake.Embed(
-        title=f"📝 Заявление в семью #{application['id']}",
+        title=f"📝 Заявление в {application['family_name']} #{application['id']}",
         description=f"Кандидат: {applicant.mention}",
         color=disnake.Color.gold(),
         timestamp=application["created_at"],
     )
     embed.set_thumbnail(url=applicant.display_avatar.url)
+    embed.add_field(name="🤝 Выбранная фама", value=f"**{application['family_name']}**", inline=False)
+    embed.add_field(name="🏠 Сервер-источник", value=f"**{applicant.guild.name}**\n`{application['guild_id']}`", inline=False)
     if previous:
         history = "\n".join(
-            f"`#{row['id']}` — **{STATUS_NAMES.get(row['status'], row['status'])}** · <t:{int(row['created_at'].timestamp())}:D>"
+            f"`#{row['id']}` · **{row['family_name']}** — "
+            f"**{STATUS_NAMES.get(row['status'], row['status'])}** · "
+            f"<t:{int(row['created_at'].timestamp())}:D>"
             for row in previous
         )
     else:
@@ -56,26 +64,35 @@ def application_embed(
     embed.add_field(name="🎮 Ник в игре", value=application["game_nickname"], inline=True)
     embed.add_field(name="#️⃣ Статик", value=application["static_id"], inline=True)
     embed.add_field(name="🎂 Возраст OOC", value=str(application["ooc_age"]), inline=True)
-    embed.add_field(name="🎯 Цель вступления", value=application["goal"], inline=False)
+    embed.add_field(name="🎯 Цель вступления и игровой сервер (Seattle/Orlando)", value=application["goal"], inline=False)
     embed.add_field(name="🖼️ Ссылка на фото", value=application["screenshot_url"], inline=False)
     embed.add_field(name="👤 Пользователь", value=f"{applicant.mention}\n`{applicant}` · `{applicant.id}`", inline=False)
     embed.add_field(name="📌 Статус", value=STATUS_NAMES[application["status"]], inline=False)
-    embed.set_footer(text="INTOLERANCE • Набор в семью")
+    embed.set_footer(text="INTERPOLOV & INTOLERANCE • Общий набор")
     return embed
 
 
 class ApplicationModal(disnake.ui.Modal):
-    def __init__(self, cog: "ApplicationsCog", config: asyncpg.Record) -> None:
+    def __init__(
+        self, cog: "ApplicationsCog", config: asyncpg.Record, family_key: str
+    ) -> None:
         self.cog = cog
         self.config = config
+        self.family_key = family_key
+        self.family_name = FAMILY_NAMES[family_key]
         components = [
             disnake.ui.TextInput(label="Ваш ник в игре", custom_id="game_nickname", max_length=100),
             disnake.ui.TextInput(label="Статик #", custom_id="static_id", max_length=30),
             disnake.ui.TextInput(label="Возраст OOC", custom_id="ooc_age", max_length=2),
-            disnake.ui.TextInput(label="Цель вступления", custom_id="goal", style=disnake.TextInputStyle.paragraph, max_length=500),
+            disnake.ui.TextInput(label="Цель вступления и сервер Seattle/Orlando", custom_id="goal", style=disnake.TextInputStyle.paragraph, max_length=500),
             disnake.ui.TextInput(label="Ссылка на фото персонажа", custom_id="screenshot_url", max_length=500),
         ]
-        super().__init__(title="Заявка в семью", custom_id="family_application:modal", components=components, timeout=600)
+        super().__init__(
+            title=f"Заявка в {self.family_name}",
+            custom_id=f"family_application:modal:{family_key}",
+            components=components,
+            timeout=600,
+        )
 
     async def callback(self, inter: disnake.ModalInteraction) -> None:
         if not isinstance(inter.author, disnake.Member):
@@ -92,7 +109,9 @@ class ApplicationModal(disnake.ui.Modal):
         if not screenshot_url.startswith(("https://", "http://")):
             await inter.response.send_message("Ссылка на фото должна начинаться с `https://`.", ephemeral=True)
             return
-        if await self.cog.bot.database.has_open_application(inter.author.id):
+        if inter.guild_id is None:
+            return
+        if await self.cog.bot.database.has_open_application(inter.author.id, inter.guild_id):
             await inter.response.send_message("У вас уже есть открытая заявка.", ephemeral=True)
             return
 
@@ -115,7 +134,9 @@ class ApplicationModal(disnake.ui.Modal):
         }
         try:
             ticket = await category.create_text_channel(
-                f"application-{safe_name}", overwrites=overwrites, reason=f"Заявка в семью от {inter.author}"
+                f"{self.family_key}-{safe_name}",
+                overwrites=overwrites,
+                reason=f"Заявка в {self.family_name} от {inter.author}",
             )
         except disnake.DiscordException:
             logging.exception("Could not create application ticket")
@@ -123,6 +144,8 @@ class ApplicationModal(disnake.ui.Modal):
             return
 
         application = await self.cog.bot.database.create_application(
+            guild.id,
+            self.family_name,
             inter.author.id,
             str(inter.author),
             inter.text_values["game_nickname"].strip(),
@@ -157,7 +180,7 @@ class ApplicationModal(disnake.ui.Modal):
             try:
                 await application_log_channel.send(
                     content=(
-                        f"🧾 **Новая заявка #{application['id']}**\n"
+                        f"🧾 **Новая заявка в {self.family_name} #{application['id']}**\n"
                         f"Кандидат: {inter.author.mention} · Тикет: {ticket.mention}"
                     ),
                     embed=embed,
@@ -177,7 +200,7 @@ class ApplicationsCog(commands.Cog):
     @commands.slash_command(
         name="applications",
         description="Настройка заявок в семью",
-        guild_ids=[GUILD_ID],
+        guild_ids=GUILD_IDS,
         default_member_permissions=disnake.Permissions(administrator=True),
     )
     async def applications(self, inter: disnake.ApplicationCommandInteraction) -> None:
@@ -191,34 +214,56 @@ class ApplicationsCog(commands.Cog):
         panel_channel: disnake.TextChannel = commands.Param(description="Канал с кнопкой подачи заявки"),
         ticket_category: disnake.CategoryChannel = commands.Param(description="Категория приватных тикетов"),
         reviewer_role: disnake.Role = commands.Param(description="Роль рекрутёров"),
-        accepted_role: disnake.Role = commands.Param(description="Роль принятого члена семьи"),
+        interpolov_role: disnake.Role = commands.Param(description="Роль участника INTERPOLOV"),
+        intolerance_role: disnake.Role = commands.Param(description="Роль участника INTOLERANCE"),
     ) -> None:
-        if accepted_role.id not in TARGET_ROLE_IDS:
-            await inter.response.send_message(
-                "Роль принятого пользователя должна быть одной из семейных ролей `TARGET_ROLE_IDS`.",
-                ephemeral=True,
-            )
+        if inter.guild_id is None:
             return
         await self.bot.database.save_application_config(
-            panel_channel.id, ticket_category.id, reviewer_role.id, accepted_role.id
+            inter.guild_id,
+            panel_channel.id,
+            ticket_category.id,
+            reviewer_role.id,
+            interpolov_role.id,
+            intolerance_role.id,
         )
         embed = disnake.Embed(
-            title="Вступление в семью",
-            description="Нажмите кнопку ниже и заполните небольшую анкету. После отправки будет создан приватный тикет с рекрутёрами.",
+            title="INTERPOLOV & INTOLERANCE",
+            description=(
+                "Выберите фаму, в которую хотите вступить, и заполните анкету. "
+                "После отправки будет создан приватный тикет с рекрутёрами."
+            ),
             color=disnake.Color.red(),
         )
-        embed.set_footer(text="INTOLERANCE • Набор в семью")
-        button = disnake.ui.Button(
-            label="Подать заявку в семью", emoji="📝", style=disnake.ButtonStyle.danger,
-            custom_id="family_application:open",
-        )
-        message = await panel_channel.send(embed=embed, components=[button])
-        await self.bot.database.set_application_panel_message(message.id)
+        embed.set_footer(text="INTERPOLOV & INTOLERANCE • Общий набор")
+        buttons = [
+            disnake.ui.Button(
+                label="Вступить в INTERPOLOV",
+                emoji="🟦",
+                style=disnake.ButtonStyle.primary,
+                custom_id="family_application:open:interpolov",
+            ),
+            disnake.ui.Button(
+                label="Вступить в INTOLERANCE",
+                emoji="🟥",
+                style=disnake.ButtonStyle.danger,
+                custom_id="family_application:open:intolerance",
+            ),
+        ]
+        message = await panel_channel.send(embed=embed, components=buttons)
+        await self.bot.database.set_application_panel_message(inter.guild_id, message.id)
         await inter.response.send_message(f"✅ Панель создана в {panel_channel.mention}.", ephemeral=True)
         await send_admin_log(
             self.bot,
             title="🧾 Панель заявок настроена",
-            description=f"Администратор: {inter.author.mention}\nКанал: {panel_channel.mention}\nКатегория: **{ticket_category.name}**\nРекрутёры: {reviewer_role.mention}\nРоль принятого: {accepted_role.mention}",
+            description=(
+                f"Администратор: {inter.author.mention}\n"
+                f"Канал: {panel_channel.mention}\n"
+                f"Категория: **{ticket_category.name}**\n"
+                f"Рекрутёры: {reviewer_role.mention}\n"
+                f"INTERPOLOV: {interpolov_role.mention}\n"
+                f"INTOLERANCE: {intolerance_role.mention}"
+            ),
             color=disnake.Color.green(),
         )
 
@@ -226,21 +271,33 @@ class ApplicationsCog(commands.Cog):
     async def application_button(self, inter: disnake.MessageInteraction) -> None:
         custom_id = inter.component.custom_id or ""
         if custom_id == "family_application:open":
-            config = await self.bot.database.get_application_config()
+            family_key = "intolerance"
+        elif custom_id.startswith("family_application:open:"):
+            family_key = custom_id.rsplit(":", 1)[-1]
+        else:
+            family_key = None
+        if family_key is not None:
+            if family_key not in FAMILY_NAMES:
+                return
+            if inter.guild_id is None:
+                return
+            config = await self.bot.database.get_application_config(inter.guild_id)
             if config is None:
                 await inter.response.send_message("Система заявок ещё не настроена.", ephemeral=True)
                 return
-            if await self.bot.database.has_open_application(inter.author.id):
+            if await self.bot.database.has_open_application(inter.author.id, inter.guild_id):
                 await inter.response.send_message("У вас уже есть открытая заявка.", ephemeral=True)
                 return
-            await inter.response.send_modal(ApplicationModal(self, config))
+            await inter.response.send_modal(ApplicationModal(self, config, family_key))
             return
         if not custom_id.startswith("application:"):
             return
 
         if not isinstance(inter.author, disnake.Member):
             return
-        config = await self.bot.database.get_application_config()
+        if inter.guild_id is None:
+            return
+        config = await self.bot.database.get_application_config(inter.guild_id)
         reviewer_role = inter.guild.get_role(config["reviewer_role_id"]) if config and inter.guild else None
         allowed = inter.author.guild_permissions.administrator or (
             reviewer_role is not None and reviewer_role in inter.author.roles
@@ -281,8 +338,13 @@ class ApplicationsCog(commands.Cog):
             return
         applicant = inter.guild.get_member(application["discord_id"]) if inter.guild else None
         if status == "accepted" and applicant is not None and config is not None:
-            accepted_role = inter.guild.get_role(config["accepted_role_id"])
-            if accepted_role is not None and accepted_role.id in TARGET_ROLE_IDS:
+            role_column = (
+                "interpolov_role_id"
+                if application["family_name"] == "INTERPOLOV"
+                else "intolerance_role_id"
+            )
+            accepted_role = inter.guild.get_role(config[role_column])
+            if accepted_role is not None:
                 try:
                     await applicant.add_roles(
                         accepted_role, reason=f"Заявка #{application_id} принята"
@@ -291,8 +353,8 @@ class ApplicationsCog(commands.Cog):
                 except disnake.DiscordException:
                     logging.exception("Could not add accepted family role")
 
-            if any(role.id in TARGET_ROLE_IDS for role in applicant.roles):
-                await self.bot.database.save_users([applicant])
+            if accepted_role is not None and accepted_role in applicant.roles:
+                await self.bot.database.save_users([applicant], role_ids={accepted_role.id})
                 profile = await self.bot.database.get_user(applicant.id)
                 if profile is not None:
                     await self.bot.database.update_user_profile(
@@ -300,6 +362,9 @@ class ApplicationsCog(commands.Cog):
                         game_nickname=application["game_nickname"],
                         added_by=inter.author.id,
                         reactivate=True,
+                    )
+                    await self.bot.database.set_user_family(
+                        applicant.id, application["family_name"]
                     )
             else:
                 logging.error(
@@ -326,7 +391,8 @@ class ApplicationsCog(commands.Cog):
         if applicant is not None:
             try:
                 await applicant.send(
-                    f"Статус вашей заявки **#{application_id}** изменён: **{STATUS_NAMES[status]}**."
+                    f"Статус вашей заявки в **{application['family_name']}** "
+                    f"**#{application_id}** изменён: **{STATUS_NAMES[status]}**."
                 )
             except disnake.DiscordException:
                 pass

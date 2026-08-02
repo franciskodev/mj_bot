@@ -14,13 +14,19 @@ Main files:
 ## Bot Rules
 
 - Keep the bot slash-command only. Do not add prefix commands.
-- The bot must work only in guild `1522843375840268338`.
+- The bot's main functionality must work only in guild `1278169762140258367`.
+- Guild `1522843375840268338` is also authorized, but only for the administrator-only
+  DM broadcast command.
 - The broadcast command must stay restricted to Discord administrators.
-- Do not remove DM forwarding to channel `1532145285185278032` unless explicitly requested.
-- Broadcast recipients are members with roles:
-  - `1522843375965831271`
-  - `1528511540779811046`
+- Do not remove DM forwarding to channel `1532839066565873724` unless explicitly requested.
+- On the main guild, broadcast recipients use configured family roles.
+- On guild `1522843375840268338`, broadcast recipients have roles
+  `1522843375965831271` or `1528511540779811046`.
 - The broadcast text is intentionally defined in code as `BROADCAST_TEXT`.
+- The main guild uses a shared `INTERPOLOV & INTOLERANCE` recruitment panel.
+- Recruitment must provide separate forms and accepted roles for `INTERPOLOV`
+  and `INTOLERANCE`.
+- Applications must store and display the selected family.
 
 ## Development
 
