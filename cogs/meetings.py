@@ -153,7 +153,10 @@ class MeetingsCog(commands.Cog):
             member.id
             for member in channel.guild.members
             if not member.bot
-            and any(role.id in family_role_ids for role in member.roles)
+            and (
+                member.guild_permissions.administrator
+                or any(role.id in family_role_ids for role in member.roles)
+            )
         ]
         meeting_id, attendance = await self.bot.database.record_meeting_attendance(
             channel.id, inter.author.id, present_ids, family_ids

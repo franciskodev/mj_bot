@@ -35,6 +35,7 @@ class ActivityCog(commands.Cog):
                 {config["interpolov_role_id"], config["intolerance_role_id"]}
             )
         return role_ids
+
     async def sync_member_family(self, member: disnake.Member) -> None:
         config = await self.bot.database.get_application_config(member.guild.id)
         if config is None:
@@ -101,6 +102,27 @@ class ActivityCog(commands.Cog):
         after_family_roles = [role for role in after.roles if role.id in family_role_ids]
         await self.sync_member_family(after)
 
+        if after.guild_permissions.administrator:
+            profile = await self.bot.database.get_user(after.id)
+            if profile is None or not profile["is_active"]:
+                await self.bot.database.save_users([after], role_ids=family_role_ids)
+                profile = await self.bot.database.update_user_profile(
+                    after.id,
+                    profile_status="Активен",
+                    reactivate=True,
+                )
+                if profile is not None:
+                    await send_admin_log(
+                        self.bot,
+                        title="✅ Администратор добавлен в семью",
+                        description=(
+                            f"Пользователь: {after.mention} (`{after.id}`)\n"
+                            "Причина: **права администратора**"
+                        ),
+                        color=disnake.Color.green(),
+                    )
+            return
+
         if not before_family_roles and after_family_roles:
             await self.bot.database.save_users([after], role_ids=family_role_ids)
             profile = await self.bot.database.update_user_profile(
@@ -120,9 +142,6 @@ class ActivityCog(commands.Cog):
                     ),
                     color=disnake.Color.green(),
                 )
-            return
-
-        if after.guild_permissions.administrator:
             return
 
         if not before_family_roles or after_family_roles:

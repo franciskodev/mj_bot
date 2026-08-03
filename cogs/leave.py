@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 import disnake
 from disnake.ext import commands, tasks
 
-from config import ADMIN_LOG_CHANNEL_ID, GUILD_ID, GUILD_IDS, LEAVE_ROLE_ID
+from config import ADMIN_LOG_CHANNEL_ID, GUILD_ID, GUILD_IDS, LEAVE_ROLE_ID, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -74,6 +74,21 @@ class LeaveCog(commands.Cog):
         reason: str = commands.Param(description="Причина отпуска", max_length=500),
         days: int = commands.Param(description="Продолжительность в днях", ge=1, le=30),
     ) -> None:
+        family_role_ids = set(TARGET_ROLE_IDS)
+        config = await self.bot.database.get_application_config(inter.guild_id)
+        if config is not None:
+            family_role_ids.update(
+                {config["interpolov_role_id"], config["intolerance_role_id"]}
+            )
+        if not isinstance(inter.author, disnake.Member) or not any(
+            role.id in family_role_ids for role in inter.author.roles
+        ):
+            await inter.response.send_message(
+                "Подать заявку на отпуск могут только участники с семейной ролью.",
+                ephemeral=True,
+            )
+            return
+
         profile = await self.bot.database.get_user(inter.author.id)
         if profile is None:
             await inter.response.send_message(
