@@ -461,6 +461,15 @@ class Database:
             discord_id,
         ))
 
+    async def get_active_leave_user_ids(self) -> set[int]:
+        if self.pool is None:
+            return set()
+        rows = await self.pool.fetch(
+            """SELECT DISTINCT discord_id FROM leave_requests
+            WHERE status='approved' AND ends_at>NOW()"""
+        )
+        return {row["discord_id"] for row in rows}
+
     async def get_activity_enforcement_started_at(self, guild_id: int) -> datetime:
         if self.pool is None:
             raise RuntimeError("Database is not connected")

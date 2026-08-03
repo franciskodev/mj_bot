@@ -1,4 +1,5 @@
 .env
+.bash_history
 .venv/
 venv/
 __pycache__/

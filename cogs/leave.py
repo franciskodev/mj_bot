@@ -2,9 +2,9 @@ import logging
 from typing import TYPE_CHECKING
 
 import disnake
-from disnake.ext import commands
+from disnake.ext import commands, tasks
 
-from config import ADMIN_LOG_CHANNEL_ID, GUILD_IDS
+from config import ADMIN_LOG_CHANNEL_ID, GUILD_ID, GUILD_IDS, LEAVE_ROLE_ID
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -14,6 +14,54 @@ if TYPE_CHECKING:
 class LeaveCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
+        self.sync_leave_roles.start()
+
+    def cog_unload(self) -> None:
+        self.sync_leave_roles.cancel()
+
+    async def set_leave_role(self, discord_id: int, *, enabled: bool) -> None:
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        role = guild.get_role(LEAVE_ROLE_ID)
+        if role is None:
+            logging.warning("Leave role %s was not found in guild %s", LEAVE_ROLE_ID, GUILD_ID)
+            return
+        member = guild.get_member(discord_id)
+        try:
+            if member is None:
+                member = await guild.fetch_member(discord_id)
+            if enabled and role not in member.roles:
+                await member.add_roles(role, reason="Одобрен отпуск")
+            elif not enabled and role in member.roles:
+                await member.remove_roles(role, reason="Отпуск завершён")
+        except disnake.NotFound:
+            return
+        except disnake.HTTPException:
+            logging.exception("Failed to update leave role for member %s", discord_id)
+
+    @tasks.loop(minutes=5)
+    async def sync_leave_roles(self) -> None:
+        try:
+            guild = self.bot.get_guild(GUILD_ID)
+            if guild is None:
+                return
+            role = guild.get_role(LEAVE_ROLE_ID)
+            if role is None:
+                logging.warning("Leave role %s was not found in guild %s", LEAVE_ROLE_ID, GUILD_ID)
+                return
+            active_user_ids = await self.bot.database.get_active_leave_user_ids()
+            for discord_id in active_user_ids:
+                await self.set_leave_role(discord_id, enabled=True)
+            for member in role.members:
+                if member.id not in active_user_ids:
+                    await self.set_leave_role(member.id, enabled=False)
+        except Exception:
+            logging.exception("Leave role synchronization failed")
+
+    @sync_leave_roles.before_loop
+    async def before_sync_leave_roles(self) -> None:
+        await self.bot.wait_until_ready()
 
     @commands.slash_command(name="leave", description="Управление отпуском", guild_ids=GUILD_IDS)
     async def leave(self, inter: disnake.ApplicationCommandInteraction) -> None:
@@ -98,6 +146,8 @@ class LeaveCog(commands.Cog):
         embed.color = disnake.Color.green() if approved else disnake.Color.red()
         embed.add_field(name="👮 Решение", value=f"{inter.author.mention}\n<t:{int(disnake.utils.utcnow().timestamp())}:f>", inline=False)
         await inter.response.edit_message(embed=embed, components=[])
+        if approved:
+            await self.set_leave_role(request["discord_id"], enabled=True)
         await send_admin_log(
             self.bot,
             title="✅ Отпуск одобрен" if approved else "❌ Отпуск отклонён",
