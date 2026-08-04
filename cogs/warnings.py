@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 import disnake
 from disnake.ext import commands
 
-from config import GUILD_IDS
+from config import GUILD_IDS, WARNING_LOG_CHANNEL_ID
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -17,6 +17,7 @@ async def notify_warning(
     administrator: disnake.Member | disnake.User,
     reason: str,
     count: int,
+    warning_id: int | None = None,
 ) -> bool:
     embed = disnake.Embed(
         title="⚠️ Вам выдан выговор",
@@ -46,6 +47,43 @@ async def notify_warning(
         ),
         color=disnake.Color.orange(),
     )
+    channel = bot.get_channel(WARNING_LOG_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(WARNING_LOG_CHANNEL_ID)
+        except disnake.DiscordException:
+            logging.exception("Could not fetch warning log channel")
+            return delivered
+    if not isinstance(channel, (disnake.TextChannel, disnake.Thread)):
+        logging.error(
+            "Warning log channel %s is not a text channel",
+            WARNING_LOG_CHANNEL_ID,
+        )
+        return delivered
+
+    log_embed = disnake.Embed(
+        title="⚠️ Выдан выговор",
+        description=(
+            f"Администратор: {administrator.mention} (`{administrator.id}`)\n"
+            f"Пользователь: {member.mention} (`{member.id}`)"
+        ),
+        color=disnake.Color.orange(),
+        timestamp=disnake.utils.utcnow(),
+    )
+    if warning_id is not None:
+        log_embed.add_field(name="Номер выговора", value=f"`#{warning_id}`", inline=True)
+    log_embed.add_field(name="Активных выговоров", value=f"**{count}/3**", inline=True)
+    log_embed.add_field(
+        name="Личное сообщение",
+        value="Доставлено" if delivered else "Не доставлено",
+        inline=True,
+    )
+    log_embed.add_field(name="Причина", value=reason, inline=False)
+    log_embed.set_footer(text="INTERPOLOV & INTOLERANCE • Журнал выговоров")
+    try:
+        await channel.send(embed=log_embed)
+    except disnake.DiscordException:
+        logging.exception("Could not send warning log")
     return delivered
 
 
@@ -85,7 +123,14 @@ class WarningsCog(commands.Cog):
                 content=f"У {member.mention} уже максимальное количество выговоров (**3/3**)."
             )
             return
-        await notify_warning(self.bot, member, inter.author, reason, count)
+        await notify_warning(
+            self.bot,
+            member,
+            inter.author,
+            reason,
+            count,
+            warning_id=row["id"],
+        )
         await inter.edit_original_response(
             content=f"⚠️ {member.mention} выдан выговор. Активных: **{count}/3**."
         )

@@ -168,7 +168,14 @@ class MeetingPaginator(disnake.ui.View):
             if error == "already_issued":
                 duplicates += 1
                 continue
-            if not await notify_warning(self.bot, member, inter.author, reason, count):
+            if not await notify_warning(
+                self.bot,
+                member,
+                inter.author,
+                reason,
+                count,
+                warning_id=row["id"],
+            ):
                 dm_failed += 1
             issued += 1
 

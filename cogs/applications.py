@@ -392,7 +392,9 @@ class ApplicationsCog(commands.Cog):
             try:
                 await applicant.send(
                     f"Статус вашей заявки в **{application['family_name']}** "
-                    f"**#{application_id}** изменён: **{STATUS_NAMES[status]}**."
+                    f"**#{application_id}** изменён: **{STATUS_NAMES[status]}**.\n"
+                    f"Решение принял: **{inter.author}** "
+                    f"({inter.author.mention}, `{inter.author.id}`)."
                 )
             except disnake.DiscordException:
                 pass

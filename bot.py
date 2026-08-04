@@ -9,6 +9,7 @@ from cogs.direct_messages import DirectMessagesCog
 from cogs.general import GeneralCog
 from cogs.leave import LeaveCog
 from cogs.meetings import MeetingsCog
+from cogs.management import ManagementCog
 from cogs.server_tags import ServerTagsCog
 from cogs.users import UsersCog
 from cogs.warnings import WarningsCog
@@ -32,6 +33,7 @@ class IntoleranceBot(commands.InteractionBot):
         self.add_cog(ActivityCog(self))
         self.add_cog(LeaveCog(self))
         self.add_cog(MeetingsCog(self))
+        self.add_cog(ManagementCog(self))
         self.add_cog(ServerTagsCog(self))
         self.add_cog(WarningsCog(self))
         self.add_cog(ApplicationsCog(self))

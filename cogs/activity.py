@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING
 import disnake
 from disnake.ext import commands, tasks
 
-from config import ALLOWED_GUILD_IDS, GUILD_ID, TARGET_ROLE_IDS
+from config import (
+    ALLOWED_GUILD_IDS,
+    FAMILY_MEMBER_ROLE_ID,
+    FAMILY_ROLE_IDS_FOR_SYNC,
+    GUILD_ID,
+    TARGET_ROLE_IDS,
+)
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -21,11 +27,13 @@ class ActivityCog(commands.Cog):
         self.check_inactive.start()
         self.check_daily_warnings.start()
         self.check_family_roles.start()
+        self.sync_family_member_roles.start()
 
     def cog_unload(self) -> None:
         self.check_inactive.cancel()
         self.check_daily_warnings.cancel()
         self.check_family_roles.cancel()
+        self.sync_family_member_roles.cancel()
 
     async def get_family_role_ids(self) -> set[int]:
         role_ids = set(TARGET_ROLE_IDS)
@@ -52,6 +60,35 @@ class ActivityCog(commands.Cog):
         if len(families) == 1:
             await self.bot.database.set_user_family(member.id, families[0])
 
+    async def ensure_family_member_role(self, member: disnake.Member) -> None:
+        if member.bot or member.guild.id != GUILD_ID:
+            return
+
+        member_role_ids = {role.id for role in member.roles}
+        if (
+            FAMILY_MEMBER_ROLE_ID in member_role_ids
+            or not member_role_ids.intersection(FAMILY_ROLE_IDS_FOR_SYNC)
+        ):
+            return
+
+        family_member_role = member.guild.get_role(FAMILY_MEMBER_ROLE_ID)
+        if family_member_role is None:
+            logging.error(
+                "Family member role %s was not found in guild %s",
+                FAMILY_MEMBER_ROLE_ID,
+                member.guild.id,
+            )
+            return
+
+        try:
+            await member.add_roles(
+                family_member_role,
+                reason="Автоматическая роль участника семьи",
+            )
+        except disnake.DiscordException:
+            logging.exception(
+                "Could not add family member role to member %s", member.id
+            )
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
@@ -95,6 +132,7 @@ class ActivityCog(commands.Cog):
         before: disnake.Member,
         after: disnake.Member,
     ) -> None:
+        await self.ensure_family_member_role(after)
         if after.guild.id != GUILD_ID or after.id in self.automated_role_removals:
             return
         family_role_ids = await self.get_family_role_ids()
@@ -189,6 +227,15 @@ class ActivityCog(commands.Cog):
             ),
             color=disnake.Color.red(),
         )
+
+    @tasks.loop(minutes=40)
+    async def sync_family_member_roles(self) -> None:
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+
+        for member in guild.members:
+            await self.ensure_family_member_role(member)
 
     @tasks.loop(minutes=5)
     async def check_family_roles(self) -> None:
@@ -377,4 +424,8 @@ class ActivityCog(commands.Cog):
 
     @check_family_roles.before_loop
     async def before_family_roles_check(self) -> None:
+        await self.bot.wait_until_ready()
+
+    @sync_family_member_roles.before_loop
+    async def before_family_member_roles_sync(self) -> None:
         await self.bot.wait_until_ready()

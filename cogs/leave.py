@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 import disnake
 from disnake.ext import commands, tasks
 
-from config import ADMIN_LOG_CHANNEL_ID, GUILD_ID, GUILD_IDS, LEAVE_ROLE_ID, TARGET_ROLE_IDS
+from config import GUILD_ID, GUILD_IDS, LEAVE_ROLE_ID, MANAGEMENT_LOG_CHANNEL_ID, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -28,6 +28,13 @@ class LeaveRequestModal(disnake.ui.Modal):
                     label="Количество дней (от 1 до 30)",
                     custom_id="days",
                     max_length=2,
+                ),
+                disnake.ui.TextInput(
+                    label="Доказательства (при наличии)",
+                    custom_id="evidence",
+                    style=disnake.TextInputStyle.paragraph,
+                    required=False,
+                    max_length=1000,
                 ),
             ],
             timeout=600,
@@ -55,6 +62,7 @@ class LeaveRequestModal(disnake.ui.Modal):
             inter,
             reason,
             days,
+            inter.text_values["evidence"].strip(),
         )
 
 
@@ -157,6 +165,7 @@ class LeaveCog(commands.Cog):
         inter: disnake.ModalInteraction,
         reason: str,
         days: int,
+        evidence: str = "",
     ) -> None:
         error = await self.get_leave_request_error(inter)
         if error is not None:
@@ -166,9 +175,9 @@ class LeaveCog(commands.Cog):
         profile = await self.bot.database.get_user(inter.author.id)
         await inter.response.defer(ephemeral=True)
         request = await self.bot.database.create_leave_request(inter.author.id, reason, days)
-        channel = self.bot.get_channel(ADMIN_LOG_CHANNEL_ID)
+        channel = self.bot.get_channel(MANAGEMENT_LOG_CHANNEL_ID)
         if channel is None:
-            channel = await self.bot.fetch_channel(ADMIN_LOG_CHANNEL_ID)
+            channel = await self.bot.fetch_channel(MANAGEMENT_LOG_CHANNEL_ID)
         if not isinstance(channel, (disnake.TextChannel, disnake.Thread)):
             await inter.edit_original_response("Канал заявок недоступен.")
             return
@@ -185,6 +194,7 @@ class LeaveCog(commands.Cog):
         embed.add_field(name="🌐 Сервер", value=profile["server_name"] or "—", inline=True)
         embed.add_field(name="📆 Срок", value=f"**{days}** дн.\nДо <t:{int(request['ends_at'].timestamp())}:D>", inline=True)
         embed.add_field(name="📝 Причина", value=reason, inline=False)
+        embed.add_field(name="🔗 Доказательства", value=evidence or "Не указаны", inline=False)
         embed.add_field(name="🆔 Discord ID", value=f"`{inter.author.id}`", inline=True)
         embed.set_footer(text=f"INTERPOLOV & INTOLERANCE • Заявка #{request['id']}")
         components = [
@@ -223,6 +233,22 @@ class LeaveCog(commands.Cog):
         await inter.response.edit_message(embed=embed, components=[])
         if approved:
             await self.set_leave_role(request["discord_id"], enabled=True)
+        member = inter.guild.get_member(request["discord_id"]) if inter.guild else None
+        if member is None and inter.guild is not None:
+            try:
+                member = await inter.guild.fetch_member(request["discord_id"])
+            except disnake.DiscordException:
+                member = None
+        if member is not None:
+            try:
+                await member.send(
+                    f"Ваша заявка на отпуск `#{request_id}` "
+                    f"**{'одобрена' if approved else 'отклонена'}**.\n"
+                    f"Решение принял: **{inter.author}** "
+                    f"({inter.author.mention}, `{inter.author.id}`)."
+                )
+            except disnake.DiscordException:
+                logging.warning("Could not send leave decision DM to %s", member.id)
         await send_admin_log(
             self.bot,
             title="✅ Отпуск одобрен" if approved else "❌ Отпуск отклонён",
