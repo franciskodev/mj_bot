@@ -115,6 +115,30 @@ class Database:
                 CREATE INDEX IF NOT EXISTS activity_warnings_user_created_idx
                     ON activity_warnings(discord_id, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS disciplinary_warnings (
+                    id BIGSERIAL PRIMARY KEY,
+                    discord_id BIGINT NOT NULL REFERENCES users(discord_id) ON DELETE CASCADE,
+                    issued_by BIGINT NOT NULL,
+                    reason TEXT NOT NULL,
+                    meeting_id BIGINT REFERENCES meetings(id) ON DELETE SET NULL,
+                    revoked_by BIGINT,
+                    revoked_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS disciplinary_warnings_active_user_idx
+                    ON disciplinary_warnings(discord_id) WHERE revoked_at IS NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS disciplinary_warnings_meeting_user_idx
+                    ON disciplinary_warnings(meeting_id, discord_id)
+                    WHERE meeting_id IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS server_tag_checks (
+                    discord_id BIGINT PRIMARY KEY REFERENCES users(discord_id) ON DELETE CASCADE,
+                    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    is_compliant BOOLEAN NOT NULL,
+                    last_reminded_at TIMESTAMPTZ,
+                    last_delivery_succeeded BOOLEAN
+                );
+
                 CREATE TABLE IF NOT EXISTS application_config (
                     id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id=1),
                     panel_channel_id BIGINT NOT NULL,
@@ -515,6 +539,157 @@ class Database:
                     [(meeting_id, row["discord_id"], row["present"], row["on_leave"]) for row in rows],
                 )
                 return meeting_id, list(rows)
+
+    async def issue_disciplinary_warning(
+        self,
+        discord_id: int,
+        issued_by: int,
+        reason: str,
+        meeting_id: int | None = None,
+    ) -> tuple[asyncpg.Record | None, int, str | None]:
+        """Issue one warning and return (row, active count, refusal reason)."""
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute("SELECT pg_advisory_xact_lock($1)", discord_id)
+                if meeting_id is not None and await connection.fetchval(
+                    """SELECT EXISTS(SELECT 1 FROM disciplinary_warnings
+                    WHERE discord_id=$1 AND meeting_id=$2)""",
+                    discord_id,
+                    meeting_id,
+                ):
+                    count = await connection.fetchval(
+                        """SELECT COUNT(*) FROM disciplinary_warnings
+                        WHERE discord_id=$1 AND revoked_at IS NULL""",
+                        discord_id,
+                    )
+                    return None, int(count), "already_issued"
+                count = int(await connection.fetchval(
+                    """SELECT COUNT(*) FROM disciplinary_warnings
+                    WHERE discord_id=$1 AND revoked_at IS NULL""",
+                    discord_id,
+                ))
+                if count >= 3:
+                    return None, count, "limit_reached"
+                row = await connection.fetchrow(
+                    """INSERT INTO disciplinary_warnings(
+                        discord_id,issued_by,reason,meeting_id
+                    ) VALUES($1,$2,$3,$4) RETURNING *""",
+                    discord_id,
+                    issued_by,
+                    reason,
+                    meeting_id,
+                )
+                return row, count + 1, None
+
+    async def get_disciplinary_warnings(self, discord_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return list(await self.pool.fetch(
+            """SELECT * FROM disciplinary_warnings WHERE discord_id=$1
+            ORDER BY (revoked_at IS NULL) DESC, created_at DESC""",
+            discord_id,
+        ))
+
+    async def get_active_disciplinary_warning_count(self, discord_id: int) -> int:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        count = await self.pool.fetchval(
+            """SELECT COUNT(*) FROM disciplinary_warnings
+            WHERE discord_id=$1 AND revoked_at IS NULL""",
+            discord_id,
+        )
+        return int(count)
+
+    async def get_due_server_tag_check_user_ids(
+        self, discord_ids: list[int]
+    ) -> list[int]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        if not discord_ids:
+            return []
+        rows = await self.pool.fetch(
+            """SELECT candidate.discord_id
+            FROM UNNEST($1::BIGINT[]) AS candidate(discord_id)
+            LEFT JOIN server_tag_checks check_result
+                ON check_result.discord_id=candidate.discord_id
+            WHERE check_result.checked_at IS NULL
+               OR check_result.checked_at<=NOW()-INTERVAL '24 hours'
+            ORDER BY candidate.discord_id""",
+            discord_ids,
+        )
+        return [row["discord_id"] for row in rows]
+
+    async def record_server_tag_check(
+        self,
+        discord_id: int,
+        *,
+        is_compliant: bool,
+        reminded: bool,
+        delivered: bool | None,
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO server_tag_checks(
+                discord_id,checked_at,is_compliant,last_reminded_at,
+                last_delivery_succeeded
+            ) VALUES($1,NOW(),$2,CASE WHEN $3 THEN NOW() END,$4)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                checked_at=NOW(),
+                is_compliant=EXCLUDED.is_compliant,
+                last_reminded_at=CASE WHEN $3 THEN NOW()
+                    ELSE server_tag_checks.last_reminded_at END,
+                last_delivery_succeeded=CASE WHEN $3 THEN $4
+                    ELSE server_tag_checks.last_delivery_succeeded END""",
+            discord_id,
+            is_compliant,
+            reminded,
+            delivered,
+        )
+
+    async def is_server_tag_reminder_due(self, discord_id: int) -> bool:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return bool(await self.pool.fetchval(
+            """SELECT COALESCE((SELECT last_reminded_at IS NULL
+                OR last_reminded_at<=NOW()-INTERVAL '3 days'
+                FROM server_tag_checks WHERE discord_id=$1), TRUE)""",
+            discord_id,
+        ))
+
+    async def revoke_disciplinary_warning(
+        self, warning_id: int, discord_id: int, revoked_by: int
+    ) -> tuple[asyncpg.Record | None, int]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """UPDATE disciplinary_warnings SET revoked_by=$3,revoked_at=NOW()
+                    WHERE id=$1 AND discord_id=$2 AND revoked_at IS NULL RETURNING *""",
+                    warning_id,
+                    discord_id,
+                    revoked_by,
+                )
+                count = await connection.fetchval(
+                    """SELECT COUNT(*) FROM disciplinary_warnings
+                    WHERE discord_id=$1 AND revoked_at IS NULL""",
+                    discord_id,
+                )
+                return row, int(count)
+
+    async def get_meeting_absentees(self, meeting_id: int) -> list[int]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        rows = await self.pool.fetch(
+            """SELECT discord_id FROM meeting_attendance
+            WHERE meeting_id=$1 AND present=FALSE AND on_leave=FALSE
+            ORDER BY discord_id""",
+            meeting_id,
+        )
+        return [row["discord_id"] for row in rows]
 
     async def get_daily_warning_started_at(self, guild_id: int) -> datetime:
         if self.pool is None:

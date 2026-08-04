@@ -31,6 +31,7 @@ def profile_embed(
     profile: asyncpg.Record,
     weekly_voice_seconds: int | None = None,
     total_voice_seconds: int | None = None,
+    warning_count: int | None = None,
 ) -> disnake.Embed:
     status = profile["profile_status"]
     embed = disnake.Embed(
@@ -43,6 +44,10 @@ def profile_embed(
     embed.add_field(name="🌐 Сервер", value=profile["server_name"] or "—", inline=True)
     embed.add_field(name="🤝 Семья", value=profile["family_name"] or "—", inline=True)
     embed.add_field(name="📌 Статус", value=status, inline=True)
+    if warning_count is not None:
+        embed.add_field(
+            name="⚠️ Выговоры", value=f"**{warning_count}/3**", inline=True
+        )
     if not profile["is_active"]:
         embed.add_field(
             name="⛔ Причина деактивации",
@@ -110,16 +115,21 @@ class ServerSelect(disnake.ui.StringSelect):
         profile = await self.bot.database.update_user_profile(
             self.owner_id, server_name=server_name
         )
-        weekly_voice_seconds, total_voice_seconds = await asyncio.gather(
+        weekly_voice_seconds, total_voice_seconds, warning_count = await asyncio.gather(
             self.bot.database.get_weekly_voice_seconds(self.owner_id),
             self.bot.database.get_total_voice_seconds(self.owner_id),
+            self.bot.database.get_active_disciplinary_warning_count(self.owner_id),
         )
         for option in self.options:
             option.default = option.value in self.values
         await inter.response.edit_message(
             content=f"✅ Сервер обновлён: **{server_name}**",
             embed=profile_embed(
-                self.profile_owner, profile, weekly_voice_seconds, total_voice_seconds
+                self.profile_owner,
+                profile,
+                weekly_voice_seconds,
+                total_voice_seconds,
+                warning_count,
             ) if profile else None,
             view=self.view,
         )
@@ -159,18 +169,29 @@ class UsersCog(commands.Cog):
             return
 
         if not profile["is_active"]:
+            warning_count = await self.bot.database.get_active_disciplinary_warning_count(
+                inter.author.id
+            )
             await inter.response.send_message(
-                embed=profile_embed(inter.author, profile), ephemeral=True
+                embed=profile_embed(
+                    inter.author, profile, warning_count=warning_count
+                ),
+                ephemeral=True,
             )
             return
 
-        weekly_voice_seconds, total_voice_seconds = await asyncio.gather(
+        weekly_voice_seconds, total_voice_seconds, warning_count = await asyncio.gather(
             self.bot.database.get_weekly_voice_seconds(inter.author.id),
             self.bot.database.get_total_voice_seconds(inter.author.id),
+            self.bot.database.get_active_disciplinary_warning_count(inter.author.id),
         )
         await inter.response.send_message(
             embed=profile_embed(
-                inter.author, profile, weekly_voice_seconds, total_voice_seconds
+                inter.author,
+                profile,
+                weekly_voice_seconds,
+                total_voice_seconds,
+                warning_count,
             ),
             view=UserServerView(self.bot, inter.author, profile["server_name"]),
             ephemeral=True,
@@ -284,13 +305,18 @@ class UsersCog(commands.Cog):
             await inter.response.send_message("Пользователь отсутствует в базе.", ephemeral=True)
             return
 
-        weekly_voice_seconds, total_voice_seconds = await asyncio.gather(
+        weekly_voice_seconds, total_voice_seconds, warning_count = await asyncio.gather(
             self.bot.database.get_weekly_voice_seconds(member.id),
             self.bot.database.get_total_voice_seconds(member.id),
+            self.bot.database.get_active_disciplinary_warning_count(member.id),
         )
         await inter.response.send_message(
             embed=profile_embed(
-                member, profile, weekly_voice_seconds, total_voice_seconds
+                member,
+                profile,
+                weekly_voice_seconds,
+                total_voice_seconds,
+                warning_count,
             ),
             ephemeral=True,
         )

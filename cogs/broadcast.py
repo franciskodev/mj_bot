@@ -20,6 +20,7 @@ class BroadcastSession:
     members: list[disnake.Member]
     sent: int = 0
     failed: int = 0
+    failures: list[tuple[disnake.Member, str]] = field(default_factory=list)
     stop_requested: bool = False
     pause_event: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -36,6 +37,50 @@ class BroadcastSession:
             f"Обработано: `{self.processed}/{len(self.members)}`\n"
             f"Отправлено: `{self.sent}` · Ошибок: `{self.failed}`"
         )
+
+    def failure_report(self) -> str:
+        lines = [
+            f"• {member.mention} (`{member.id}`) — {reason}"
+            for member, reason in self.failures
+        ]
+        if self.processed < len(self.members):
+            reason = (
+                "не обработан: рассылка остановлена администратором"
+                if self.stop_requested
+                else "не обработан из-за преждевременного завершения рассылки"
+            )
+            lines.extend(
+                f"• {member.mention} (`{member.id}`) — {reason}"
+                for member in self.members[self.processed:]
+            )
+        if not lines:
+            return "Ошибок доставки нет."
+        return "\n".join(lines)
+
+
+def dm_failure_reason(error: Exception) -> str:
+    if isinstance(error, disnake.Forbidden):
+        return "Discord запретил отправку: ЛС закрыты или бот заблокирован"
+    if isinstance(error, disnake.NotFound):
+        return "пользователь или личный канал больше не доступен"
+    if isinstance(error, disnake.HTTPException):
+        details = str(error).replace("\n", " ")[:300]
+        return f"ошибка Discord API (код {error.code}): {details}"
+    return f"внутренняя ошибка: {type(error).__name__}: {str(error)[:300]}"
+
+
+def split_report(text: str, limit: int = 3500) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 class BroadcastControlView(disnake.ui.View):
@@ -152,26 +197,68 @@ class BroadcastCog(commands.Cog):
                 try:
                     await member.send(session.text)
                     session.sent += 1
-                except disnake.DiscordException:
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
                     session.failed += 1
+                    reason = dm_failure_reason(error)
+                    session.failures.append((member, reason))
                     logging.exception("Could not send DM to member %s (%s)", member, member.id)
 
                 if session.processed % 5 == 0:
-                    await inter.edit_original_response(
-                        content=session.status_text("выполняется"),
-                        view=view,
-                    )
+                    try:
+                        await inter.edit_original_response(
+                            content=session.status_text("выполняется"),
+                            view=view,
+                        )
+                    except disnake.DiscordException:
+                        logging.exception(
+                            "Could not update broadcast progress at %s/%s",
+                            session.processed,
+                            len(session.members),
+                        )
 
                 # Небольшая задержка дает время управлять рассылкой и снижает нагрузку на API.
                 await asyncio.sleep(0.5)
 
             status = "остановлена" if session.stop_requested else "завершена"
             view.disable_all_items()
-            await inter.edit_original_response(
-                content=session.status_text(status),
-                view=view,
+            try:
+                await inter.edit_original_response(
+                    content=session.status_text(status),
+                    view=view,
+                )
+            except disnake.DiscordException:
+                logging.exception("Could not update final broadcast status")
+            summary = (
+                f"Итог: **{status}**\n"
+                f"Обработано: **{session.processed}/{len(session.members)}**\n"
+                f"Отправлено: **{session.sent}**\nОшибок: **{session.failed}**"
             )
-            await send_admin_log(self.bot, title="📣 Рассылка завершена", description=f"Итог: **{status}**\nОтправлено: **{session.sent}**\nОшибок: **{session.failed}**")
+            await send_admin_log(
+                self.bot,
+                title="📣 Рассылка завершена",
+                description=summary,
+            )
+            if session.failures or session.processed < len(session.members):
+                report_chunks = split_report(session.failure_report())
+                for index, chunk in enumerate(report_chunks, start=1):
+                    embed = disnake.Embed(
+                        title=f"❌ Не доставлена рассылка ({index}/{len(report_chunks)})",
+                        description=chunk,
+                        color=disnake.Color.red(),
+                        timestamp=disnake.utils.utcnow(),
+                    )
+                    try:
+                        await inter.followup.send(embed=embed, ephemeral=True)
+                    except disnake.DiscordException:
+                        logging.exception("Could not send private broadcast failure report")
+                    await send_admin_log(
+                        self.bot,
+                        title=f"❌ Ошибки рассылки ({index}/{len(report_chunks)})",
+                        description=chunk,
+                        color=disnake.Color.red(),
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:

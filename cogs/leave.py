@@ -11,6 +11,53 @@ if TYPE_CHECKING:
     from bot import IntoleranceBot
 
 
+class LeaveRequestModal(disnake.ui.Modal):
+    def __init__(self, cog: "LeaveCog") -> None:
+        self.cog = cog
+        super().__init__(
+            title="Заявка на отпуск",
+            custom_id="leave:request:modal",
+            components=[
+                disnake.ui.TextInput(
+                    label="Причина отпуска",
+                    custom_id="reason",
+                    style=disnake.TextInputStyle.paragraph,
+                    max_length=500,
+                ),
+                disnake.ui.TextInput(
+                    label="Количество дней (от 1 до 30)",
+                    custom_id="days",
+                    max_length=2,
+                ),
+            ],
+            timeout=600,
+        )
+
+    async def callback(self, inter: disnake.ModalInteraction) -> None:
+        reason = inter.text_values["reason"].strip()
+        if not reason:
+            await inter.response.send_message("Укажите причину отпуска.", ephemeral=True)
+            return
+        try:
+            days = int(inter.text_values["days"].strip())
+        except ValueError:
+            await inter.response.send_message(
+                "Количество дней должно быть указано числом.", ephemeral=True
+            )
+            return
+        if not 1 <= days <= 30:
+            await inter.response.send_message(
+                "Укажите продолжительность отпуска от 1 до 30 дней.", ephemeral=True
+            )
+            return
+
+        await self.cog.submit_leave_request(
+            inter,
+            reason,
+            days,
+        )
+
+
 class LeaveCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
@@ -71,9 +118,17 @@ class LeaveCog(commands.Cog):
     async def leave_request(
         self,
         inter: disnake.ApplicationCommandInteraction,
-        reason: str = commands.Param(description="Причина отпуска", max_length=500),
-        days: int = commands.Param(description="Продолжительность в днях", ge=1, le=30),
     ) -> None:
+        error = await self.get_leave_request_error(inter)
+        if error is not None:
+            await inter.response.send_message(error, ephemeral=True)
+            return
+        await inter.response.send_modal(modal=LeaveRequestModal(self))
+
+    async def get_leave_request_error(
+        self,
+        inter: disnake.ApplicationCommandInteraction | disnake.ModalInteraction,
+    ) -> str | None:
         family_role_ids = set(TARGET_ROLE_IDS)
         config = await self.bot.database.get_application_config(inter.guild_id)
         if config is not None:
@@ -83,34 +138,39 @@ class LeaveCog(commands.Cog):
         if not isinstance(inter.author, disnake.Member) or not any(
             role.id in family_role_ids for role in inter.author.roles
         ):
-            await inter.response.send_message(
-                "Подать заявку на отпуск могут только участники с семейной ролью.",
-                ephemeral=True,
-            )
-            return
+            return "Подать заявку на отпуск могут только участники с семейной ролью."
 
         profile = await self.bot.database.get_user(inter.author.id)
         if profile is None:
-            await inter.response.send_message(
-                "Ваш профиль отсутствует в базе. Обратитесь к администратору.", ephemeral=True
-            )
-            return
+            return "Ваш профиль отсутствует в базе. Обратитесь к администратору."
         if not profile["is_active"]:
-            await inter.response.send_message(
-                f"Ваш профиль неактивен: **{profile['inactive_reason'] or 'причина не указана'}**",
-                ephemeral=True,
+            return (
+                f"Ваш профиль неактивен: "
+                f"**{profile['inactive_reason'] or 'причина не указана'}**"
             )
-            return
         if await self.bot.database.has_pending_leave(inter.author.id):
-            await inter.response.send_message("У вас уже есть запрос на рассмотрении.", ephemeral=True)
+            return "У вас уже есть запрос на рассмотрении."
+        return None
+
+    async def submit_leave_request(
+        self,
+        inter: disnake.ModalInteraction,
+        reason: str,
+        days: int,
+    ) -> None:
+        error = await self.get_leave_request_error(inter)
+        if error is not None:
+            await inter.response.send_message(error, ephemeral=True)
             return
 
+        profile = await self.bot.database.get_user(inter.author.id)
+        await inter.response.defer(ephemeral=True)
         request = await self.bot.database.create_leave_request(inter.author.id, reason, days)
         channel = self.bot.get_channel(ADMIN_LOG_CHANNEL_ID)
         if channel is None:
             channel = await self.bot.fetch_channel(ADMIN_LOG_CHANNEL_ID)
         if not isinstance(channel, (disnake.TextChannel, disnake.Thread)):
-            await inter.response.send_message("Канал заявок недоступен.", ephemeral=True)
+            await inter.edit_original_response("Канал заявок недоступен.")
             return
 
         embed = disnake.Embed(
@@ -133,8 +193,8 @@ class LeaveCog(commands.Cog):
         ]
         message = await channel.send(embed=embed, components=components)
         await self.bot.database.set_leave_log_message(request["id"], message.id)
-        await inter.response.send_message(
-            f"✅ Заявка **#{request['id']}** отправлена администрации.", ephemeral=True
+        await inter.edit_original_response(
+            f"✅ Заявка **#{request['id']}** отправлена администрации."
         )
 
     @commands.Cog.listener("on_button_click")
