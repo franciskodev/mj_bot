@@ -139,6 +139,12 @@ class Database:
                     last_delivery_succeeded BOOLEAN
                 );
 
+                CREATE TABLE IF NOT EXISTS profile_server_reminders (
+                    discord_id BIGINT PRIMARY KEY REFERENCES users(discord_id) ON DELETE CASCADE,
+                    last_reminded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_delivery_succeeded BOOLEAN NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS application_config (
                     id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id=1),
                     panel_channel_id BIGINT NOT NULL,
@@ -172,6 +178,8 @@ class Database:
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS transcript_saved_at TIMESTAMPTZ;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS guild_id BIGINT;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS family_name TEXT;
+                ALTER TABLE applications ADD COLUMN IF NOT EXISTS game_server TEXT
+                    NOT NULL DEFAULT 'Не указан';
                 CREATE INDEX IF NOT EXISTS applications_user_created_idx
                     ON applications(discord_id, created_at DESC);
 
@@ -615,7 +623,7 @@ class Database:
             LEFT JOIN server_tag_checks check_result
                 ON check_result.discord_id=candidate.discord_id
             WHERE check_result.checked_at IS NULL
-               OR check_result.checked_at<=NOW()-INTERVAL '24 hours'
+               OR check_result.checked_at<=NOW()-INTERVAL '3 days'
             ORDER BY candidate.discord_id""",
             discord_ids,
         )
@@ -658,6 +666,31 @@ class Database:
                 FROM server_tag_checks WHERE discord_id=$1), TRUE)""",
             discord_id,
         ))
+
+    async def is_profile_server_reminder_due(self, discord_id: int) -> bool:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return bool(await self.pool.fetchval(
+            """SELECT COALESCE((SELECT last_reminded_at<=NOW()-INTERVAL '12 hours'
+                FROM profile_server_reminders WHERE discord_id=$1), TRUE)""",
+            discord_id,
+        ))
+
+    async def record_profile_server_reminder(
+        self, discord_id: int, delivered: bool
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO profile_server_reminders(
+                discord_id,last_reminded_at,last_delivery_succeeded
+            ) VALUES($1,NOW(),$2)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                last_reminded_at=NOW(),
+                last_delivery_succeeded=EXCLUDED.last_delivery_succeeded""",
+            discord_id,
+            delivered,
+        )
 
     async def revoke_disciplinary_warning(
         self, warning_id: int, discord_id: int, revoked_by: int
@@ -793,6 +826,7 @@ class Database:
         self,
         guild_id: int,
         family_name: str,
+        game_server: str,
         discord_id: int,
         username: str,
         game_nickname: str,
@@ -805,10 +839,10 @@ class Database:
             raise RuntimeError("Database is not connected")
         return await self.pool.fetchrow(
             """INSERT INTO applications(
-                guild_id,family_name,discord_id,username,game_nickname,static_id,ooc_age,goal,screenshot_url
-            ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *""",
-            guild_id, family_name, discord_id, username, game_nickname, static_id,
-            ooc_age, goal, screenshot_url,
+                guild_id,family_name,game_server,discord_id,username,game_nickname,static_id,ooc_age,goal,screenshot_url
+            ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""",
+            guild_id, family_name, game_server, discord_id, username,
+            game_nickname, static_id, ooc_age, goal, screenshot_url,
         )
 
     async def set_application_ticket(

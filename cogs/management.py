@@ -9,6 +9,7 @@ from config import (
     GUILD_IDS,
     MANAGEMENT_LOG_CHANNEL_ID,
     PROMOTION_LOG_CHANNEL_ID,
+    WARNING_WORKOFF_LOG_CHANNEL_ID,
 )
 
 if TYPE_CHECKING:
@@ -249,9 +250,14 @@ class ManagementCog(commands.Cog):
         request_type: str,
     ) -> None:
         await inter.response.defer(ephemeral=True)
-        channel = self.bot.get_channel(APPEAL_LOG_CHANNEL_ID)
+        channel_id = (
+            APPEAL_LOG_CHANNEL_ID
+            if request_type == "appeal"
+            else WARNING_WORKOFF_LOG_CHANNEL_ID
+        )
+        channel = self.bot.get_channel(channel_id)
         if channel is None:
-            channel = await self.bot.fetch_channel(APPEAL_LOG_CHANNEL_ID)
+            channel = await self.bot.fetch_channel(channel_id)
         if not isinstance(channel, (disnake.TextChannel, disnake.Thread)):
             await inter.edit_original_response("Канал заявок недоступен.")
             return

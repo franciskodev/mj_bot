@@ -1,12 +1,13 @@
 import asyncio
+import logging
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 import asyncpg
 import disnake
-from disnake.ext import commands
+from disnake.ext import commands, tasks
 
-from config import GUILD_IDS
+from config import GUILD_ID, GUILD_IDS, SERVER_ROLE_IDS, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -18,6 +19,45 @@ STATUS_COLORS = {
     "В отпуске": disnake.Color.gold(),
     "Неактивен": disnake.Color.red(),
 }
+
+
+def selected_servers(server_name: str | None) -> set[str]:
+    return {
+        server.strip()
+        for server in (server_name or "").split(",")
+        if server.strip() in SERVER_ROLE_IDS
+    }
+
+
+async def sync_server_roles(
+    member: disnake.Member, servers: set[str], *, reason: str
+) -> bool:
+    selected_role_ids = {SERVER_ROLE_IDS[server] for server in servers}
+    server_roles = {
+        role_id: member.guild.get_role(role_id)
+        for role_id in SERVER_ROLE_IDS.values()
+    }
+    if any(role is None for role in server_roles.values()):
+        return False
+    roles_to_add = [
+        role
+        for role_id, role in server_roles.items()
+        if role_id in selected_role_ids and role not in member.roles
+    ]
+    roles_to_remove = [
+        role
+        for role_id, role in server_roles.items()
+        if role_id not in selected_role_ids and role in member.roles
+    ]
+    try:
+        if roles_to_add:
+            await member.add_roles(*roles_to_add, reason=reason)
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason=reason)
+    except disnake.DiscordException:
+        logging.exception("Could not synchronize server roles for member %s", member.id)
+        return False
+    return True
 
 
 def format_date(value: datetime | None) -> str:
@@ -115,6 +155,11 @@ class ServerSelect(disnake.ui.StringSelect):
         profile = await self.bot.database.update_user_profile(
             self.owner_id, server_name=server_name
         )
+        role_sync_succeeded = await sync_server_roles(
+            self.profile_owner,
+            set(self.values),
+            reason="Выбор сервера в /myinfo",
+        )
         weekly_voice_seconds, total_voice_seconds, warning_count = await asyncio.gather(
             self.bot.database.get_weekly_voice_seconds(self.owner_id),
             self.bot.database.get_total_voice_seconds(self.owner_id),
@@ -123,7 +168,11 @@ class ServerSelect(disnake.ui.StringSelect):
         for option in self.options:
             option.default = option.value in self.values
         await inter.response.edit_message(
-            content=f"✅ Сервер обновлён: **{server_name}**",
+            content=(
+                f"✅ Сервер обновлён: **{server_name}**"
+                if role_sync_succeeded
+                else f"⚠️ Сервер обновлён: **{server_name}**, но бот не смог обновить роли."
+            ),
             embed=profile_embed(
                 self.profile_owner,
                 profile,
@@ -150,6 +199,82 @@ class UserServerView(disnake.ui.View):
 class UsersCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
+        self.sync_profile_server_roles.start()
+
+    def cog_unload(self) -> None:
+        self.sync_profile_server_roles.cancel()
+
+    @tasks.loop(hours=1)
+    async def sync_profile_server_roles(self) -> None:
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+
+        family_role_ids = set(TARGET_ROLE_IDS)
+        config = await self.bot.database.get_application_config(GUILD_ID)
+        if config is not None:
+            family_role_ids.update(
+                {config["interpolov_role_id"], config["intolerance_role_id"]}
+            )
+
+        profiles = await self.bot.database.get_active_users()
+        for profile in profiles:
+            member = guild.get_member(profile["discord_id"])
+            if (
+                member is None
+                or member.bot
+                or not any(role.id in family_role_ids for role in member.roles)
+            ):
+                continue
+
+            servers = selected_servers(profile["server_name"])
+            await sync_server_roles(
+                member,
+                servers,
+                reason="Ежечасовая синхронизация сервера /myinfo",
+            )
+
+            if (
+                servers
+                or member.guild_permissions.administrator
+                or profile["profile_status"] != "Активен"
+            ):
+                continue
+            if not await self.bot.database.is_profile_server_reminder_due(member.id):
+                continue
+
+            embed = disnake.Embed(
+                title="🎮 Выберите игровой сервер",
+                description=(
+                    "В вашем профиле не выбран сервер, на котором вы играете. "
+                    "Пожалуйста, обновите свой профиль.\n\n"
+                    "**Как выбрать сервер:**\n"
+                    "1. Откройте наш Discord-сервер.\n"
+                    "2. Введите команду `/myinfo`.\n"
+                    "3. Нажмите на список **«Выберите игровой сервер»**.\n"
+                    "4. Выберите **Seattle**, **Orlando** или оба сервера.\n"
+                    "5. Нажмите **«Отправить»** для сохранения.\n\n"
+                    "После сохранения бот автоматически выдаст нужную роль."
+                ),
+                color=disnake.Color.gold(),
+                timestamp=disnake.utils.utcnow(),
+            )
+            embed.set_footer(text="INTERPOLOV & INTOLERANCE • Настройка профиля")
+            delivered = True
+            try:
+                await member.send(embed=embed)
+            except disnake.DiscordException:
+                delivered = False
+                logging.warning("Could not send profile server reminder to %s", member.id)
+            await self.bot.database.record_profile_server_reminder(
+                member.id, delivered
+            )
+            await asyncio.sleep(0.25)
+
+    @sync_profile_server_roles.before_loop
+    async def before_profile_server_role_sync(self) -> None:
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(60)
 
     @commands.slash_command(
         name="myinfo",

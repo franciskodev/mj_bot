@@ -7,7 +7,7 @@ import asyncpg
 import disnake
 from disnake.ext import commands
 
-from config import APPLICATION_LOG_CHANNEL_ID, GUILD_IDS
+from config import APPLICATION_LOG_CHANNEL_ID, GUILD_IDS, SERVER_ROLE_IDS
 from log_utils import send_admin_log
 from transcript import save_application_json, save_ticket_transcript
 
@@ -26,6 +26,21 @@ FAMILY_NAMES = {
     "interpolov": "INTERPOLOV",
     "intolerance": "INTOLERANCE",
 }
+GAME_SERVERS = {
+    "seattle": "Seattle",
+    "orlando": "Orlando",
+}
+def server_select(family_key: str) -> disnake.ui.StringSelect:
+    return disnake.ui.StringSelect(
+        placeholder="Выберите один или несколько серверов",
+        custom_id=f"family_application:server:{family_key}",
+        min_values=1,
+        max_values=len(GAME_SERVERS),
+        options=[
+            disnake.SelectOption(label=server, value=key)
+            for key, server in GAME_SERVERS.items()
+        ],
+    )
 
 
 def application_buttons(application_id: int) -> list[disnake.ui.Button]:
@@ -50,6 +65,7 @@ def application_embed(
     )
     embed.set_thumbnail(url=applicant.display_avatar.url)
     embed.add_field(name="🤝 Выбранная фама", value=f"**{application['family_name']}**", inline=False)
+    embed.add_field(name="🎮 Игровые серверы", value=f"**{application['game_server']}**", inline=True)
     embed.add_field(name="🏠 Сервер-источник", value=f"**{applicant.guild.name}**\n`{application['guild_id']}`", inline=False)
     if previous:
         history = "\n".join(
@@ -64,7 +80,7 @@ def application_embed(
     embed.add_field(name="🎮 Ник в игре", value=application["game_nickname"], inline=True)
     embed.add_field(name="#️⃣ Статик", value=application["static_id"], inline=True)
     embed.add_field(name="🎂 Возраст OOC", value=str(application["ooc_age"]), inline=True)
-    embed.add_field(name="🎯 Цель вступления и игровой сервер (Seattle/Orlando)", value=application["goal"], inline=False)
+    embed.add_field(name="🎯 Цель вступления", value=application["goal"], inline=False)
     embed.add_field(name="🖼️ Ссылка на фото", value=application["screenshot_url"], inline=False)
     embed.add_field(name="👤 Пользователь", value=f"{applicant.mention}\n`{applicant}` · `{applicant.id}`", inline=False)
     embed.add_field(name="📌 Статус", value=STATUS_NAMES[application["status"]], inline=False)
@@ -74,17 +90,19 @@ def application_embed(
 
 class ApplicationModal(disnake.ui.Modal):
     def __init__(
-        self, cog: "ApplicationsCog", config: asyncpg.Record, family_key: str
+        self, cog: "ApplicationsCog", config: asyncpg.Record, family_key: str,
+        game_server: str,
     ) -> None:
         self.cog = cog
         self.config = config
         self.family_key = family_key
         self.family_name = FAMILY_NAMES[family_key]
+        self.game_server = game_server
         components = [
             disnake.ui.TextInput(label="Ваш ник в игре", custom_id="game_nickname", max_length=100),
             disnake.ui.TextInput(label="Статик #", custom_id="static_id", max_length=30),
             disnake.ui.TextInput(label="Возраст OOC", custom_id="ooc_age", max_length=2),
-            disnake.ui.TextInput(label="Цель вступления и сервер Seattle/Orlando", custom_id="goal", style=disnake.TextInputStyle.paragraph, max_length=500),
+            disnake.ui.TextInput(label="Цель вступления", custom_id="goal", style=disnake.TextInputStyle.paragraph, max_length=500),
             disnake.ui.TextInput(label="Ссылка на фото персонажа", custom_id="screenshot_url", max_length=500),
         ]
         super().__init__(
@@ -146,6 +164,7 @@ class ApplicationModal(disnake.ui.Modal):
         application = await self.cog.bot.database.create_application(
             guild.id,
             self.family_name,
+            self.game_server,
             inter.author.id,
             str(inter.author),
             inter.text_values["game_nickname"].strip(),
@@ -205,6 +224,43 @@ class ApplicationsCog(commands.Cog):
     )
     async def applications(self, inter: disnake.ApplicationCommandInteraction) -> None:
         pass
+
+    @commands.Cog.listener("on_dropdown")
+    async def application_server_select(
+        self, inter: disnake.MessageInteraction
+    ) -> None:
+        custom_id = inter.component.custom_id or ""
+        if not custom_id.startswith("family_application:server:"):
+            return
+        if inter.guild_id is None:
+            return
+
+        family_key = custom_id.rsplit(":", 1)[-1]
+        server_keys = inter.values
+        if (
+            family_key not in FAMILY_NAMES
+            or not server_keys
+            or any(server_key not in GAME_SERVERS for server_key in server_keys)
+        ):
+            await inter.response.send_message("Некорректный выбор.", ephemeral=True)
+            return
+
+        config = await self.bot.database.get_application_config(inter.guild_id)
+        if config is None:
+            await inter.response.send_message("Система заявок ещё не настроена.", ephemeral=True)
+            return
+        if await self.bot.database.has_open_application(inter.author.id, inter.guild_id):
+            await inter.response.send_message("У вас уже есть открытая заявка.", ephemeral=True)
+            return
+
+        await inter.response.send_modal(
+            ApplicationModal(
+                self,
+                config,
+                family_key,
+                ", ".join(GAME_SERVERS[server_key] for server_key in server_keys),
+            )
+        )
 
     @applications.sub_command(name="setup", description="Создать панель заявок")
     @commands.has_permissions(administrator=True)
@@ -288,7 +344,11 @@ class ApplicationsCog(commands.Cog):
             if await self.bot.database.has_open_application(inter.author.id, inter.guild_id):
                 await inter.response.send_message("У вас уже есть открытая заявка.", ephemeral=True)
                 return
-            await inter.response.send_modal(ApplicationModal(self, config, family_key))
+            await inter.response.send_message(
+                "Выберите один или несколько серверов, на которых вы играете:",
+                components=server_select(family_key),
+                ephemeral=True,
+            )
             return
         if not custom_id.startswith("application:"):
             return
@@ -344,14 +404,24 @@ class ApplicationsCog(commands.Cog):
                 else "intolerance_role_id"
             )
             accepted_role = inter.guild.get_role(config[role_column])
-            if accepted_role is not None:
+            selected_servers = {
+                server.strip() for server in application["game_server"].split(",")
+            }
+            server_roles = [
+                role
+                for server, role_id in SERVER_ROLE_IDS.items()
+                if server in selected_servers
+                and (role := inter.guild.get_role(role_id)) is not None
+            ]
+            roles_to_add = ([accepted_role] if accepted_role is not None else []) + server_roles
+            if roles_to_add:
                 try:
                     await applicant.add_roles(
-                        accepted_role, reason=f"Заявка #{application_id} принята"
+                        *roles_to_add, reason=f"Заявка #{application_id} принята"
                     )
                     applicant = await inter.guild.fetch_member(applicant.id)
                 except disnake.DiscordException:
-                    logging.exception("Could not add accepted family role")
+                    logging.exception("Could not add accepted family and server roles")
 
             if accepted_role is not None and accepted_role in applicant.roles:
                 await self.bot.database.save_users([applicant], role_ids={accepted_role.id})
