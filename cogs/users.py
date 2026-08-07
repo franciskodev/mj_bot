@@ -219,7 +219,7 @@ class UsersCog(commands.Cog):
         before: disnake.Member,
         after: disnake.Member,
     ) -> None:
-        if after.guild.id != GUILD_ID or after.bot or after.guild_permissions.administrator:
+        if after.guild.id != GUILD_ID or after.bot:
             return
 
         server_role_ids = set(SERVER_ROLE_IDS.values())

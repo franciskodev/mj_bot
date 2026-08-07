@@ -2,7 +2,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import disnake
-from disnake.ext import commands
+from disnake.ext import commands, tasks
 
 from config import (
     ALLOWED_GUILD_IDS,
@@ -20,6 +20,39 @@ if TYPE_CHECKING:
 class CoreCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
+        self.sync_default_roles.start()
+
+    def cog_unload(self) -> None:
+        self.sync_default_roles.cancel()
+
+    @tasks.loop(hours=24)
+    async def sync_default_roles(self) -> None:
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None or DEFAULT_MEMBER_ROLE_ID is None:
+            return
+
+        role = guild.get_role(DEFAULT_MEMBER_ROLE_ID)
+        if role is None:
+            logging.error("Default member role %s was not found", DEFAULT_MEMBER_ROLE_ID)
+            return
+
+        for member in guild.members:
+            if member.bot or len(member.roles) != 1:
+                continue
+            try:
+                await member.add_roles(
+                    role,
+                    reason="Ежедневная проверка участников без ролей",
+                )
+            except disnake.DiscordException:
+                logging.exception(
+                    "Could not add default role to member %s during daily sync",
+                    member.id,
+                )
+
+    @sync_default_roles.before_loop
+    async def before_sync_default_roles(self) -> None:
+        await self.bot.wait_until_ready()
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
