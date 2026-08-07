@@ -81,7 +81,7 @@ def application_embed(
     embed.add_field(name="#️⃣ Статик", value=application["static_id"], inline=True)
     embed.add_field(name="🎂 Возраст OOC", value=str(application["ooc_age"]), inline=True)
     embed.add_field(name="🎯 Цель вступления", value=application["goal"], inline=False)
-    embed.add_field(name="🖼️ Ссылка на фото", value=application["screenshot_url"], inline=False)
+    embed.add_field(name="🖼️ Фото всех персонажей", value=application["screenshot_url"], inline=False)
     embed.add_field(name="👤 Пользователь", value=f"{applicant.mention}\n`{applicant}` · `{applicant.id}`", inline=False)
     embed.add_field(name="📌 Статус", value=STATUS_NAMES[application["status"]], inline=False)
     embed.set_footer(text="INTERPOLOV & INTOLERANCE • Общий набор")
@@ -103,7 +103,7 @@ class ApplicationModal(disnake.ui.Modal):
             disnake.ui.TextInput(label="Статик #", custom_id="static_id", max_length=30),
             disnake.ui.TextInput(label="Возраст OOC", custom_id="ooc_age", max_length=2),
             disnake.ui.TextInput(label="Цель вступления", custom_id="goal", style=disnake.TextInputStyle.paragraph, max_length=500),
-            disnake.ui.TextInput(label="Ссылка на фото персонажа", custom_id="screenshot_url", max_length=500),
+            disnake.ui.TextInput(label="Фото всех персонажей (ссылкой)", custom_id="screenshot_url", max_length=500),
         ]
         super().__init__(
             title=f"Заявка в {self.family_name}",

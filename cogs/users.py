@@ -7,7 +7,7 @@ import asyncpg
 import disnake
 from disnake.ext import commands, tasks
 
-from config import GUILD_ID, GUILD_IDS, SERVER_ROLE_IDS, TARGET_ROLE_IDS
+from config import GUILD_ID, GUILD_IDS, SERVER_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -27,6 +27,15 @@ def selected_servers(server_name: str | None) -> set[str]:
         for server in (server_name or "").split(",")
         if server.strip() in SERVER_ROLE_IDS
     }
+
+
+def servers_from_roles(member: disnake.Member) -> list[str]:
+    member_role_ids = {role.id for role in member.roles}
+    return [
+        server
+        for server, role_id in SERVER_ROLE_IDS.items()
+        if role_id in member_role_ids
+    ]
 
 
 async def sync_server_roles(
@@ -199,23 +208,39 @@ class UserServerView(disnake.ui.View):
 class UsersCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
-        self.sync_profile_server_roles.start()
+        self.sync_profile_servers_from_roles.start()
 
     def cog_unload(self) -> None:
-        self.sync_profile_server_roles.cancel()
+        self.sync_profile_servers_from_roles.cancel()
 
-    @tasks.loop(hours=1)
-    async def sync_profile_server_roles(self) -> None:
+    @commands.Cog.listener()
+    async def on_member_update(
+        self,
+        before: disnake.Member,
+        after: disnake.Member,
+    ) -> None:
+        if after.guild.id != GUILD_ID or after.bot or after.guild_permissions.administrator:
+            return
+
+        server_role_ids = set(SERVER_ROLE_IDS.values())
+        before_server_roles = {role.id for role in before.roles} & server_role_ids
+        after_server_roles = {role.id for role in after.roles} & server_role_ids
+        if before_server_roles == after_server_roles:
+            return
+        if await self.bot.database.get_user(after.id) is None:
+            return
+
+        servers = servers_from_roles(after)
+        await self.bot.database.update_user_profile(
+            after.id,
+            server_name=", ".join(servers) if servers else "-",
+        )
+
+    @tasks.loop(hours=6)
+    async def sync_profile_servers_from_roles(self) -> None:
         guild = self.bot.get_guild(GUILD_ID)
         if guild is None:
             return
-
-        family_role_ids = set(TARGET_ROLE_IDS)
-        config = await self.bot.database.get_application_config(GUILD_ID)
-        if config is not None:
-            family_role_ids.update(
-                {config["interpolov_role_id"], config["intolerance_role_id"]}
-            )
 
         profiles = await self.bot.database.get_active_users()
         for profile in profiles:
@@ -223,23 +248,24 @@ class UsersCog(commands.Cog):
             if (
                 member is None
                 or member.bot
-                or not any(role.id in family_role_ids for role in member.roles)
+                or member.guild_permissions.administrator
             ):
                 continue
 
-            servers = selected_servers(profile["server_name"])
-            await sync_server_roles(
-                member,
-                servers,
-                reason="Ежечасовая синхронизация сервера /myinfo",
-            )
+            servers = servers_from_roles(member)
+            server_name = ", ".join(servers)
+            if selected_servers(profile["server_name"]) != set(servers):
+                await self.bot.database.update_user_profile(
+                    member.id,
+                    server_name=server_name if servers else "-",
+                )
 
             if (
                 servers
-                or member.guild_permissions.administrator
                 or profile["profile_status"] != "Активен"
             ):
                 continue
+
             if not await self.bot.database.is_profile_server_reminder_due(member.id):
                 continue
 
@@ -271,7 +297,7 @@ class UsersCog(commands.Cog):
             )
             await asyncio.sleep(0.25)
 
-    @sync_profile_server_roles.before_loop
+    @sync_profile_servers_from_roles.before_loop
     async def before_profile_server_role_sync(self) -> None:
         await self.bot.wait_until_ready()
         await asyncio.sleep(60)

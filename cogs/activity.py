@@ -44,6 +44,28 @@ class ActivityCog(commands.Cog):
             )
         return role_ids
 
+    @commands.slash_command(
+        name="режим_проверки",
+        description="Настроить действие бота при проверке активности",
+        guild_ids=[GUILD_ID],
+        default_member_permissions=disnake.Permissions(administrator=True),
+    )
+    @commands.has_permissions(administrator=True)
+    async def activity_check_mode(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        снимать_роли: bool = commands.Param(
+            description="Да — снимать роли, нет — только уведомлять в лог"
+        ),
+    ) -> None:
+        await self.bot.database.set_activity_remove_roles(
+            inter.guild_id or GUILD_ID, снимать_роли
+        )
+        mode = "снятие ролей" if снимать_роли else "только уведомления в лог"
+        await inter.response.send_message(
+            f"✅ Режим проверки активности: **{mode}**.", ephemeral=True
+        )
+
     async def sync_member_family(self, member: disnake.Member) -> None:
         config = await self.bot.database.get_application_config(member.guild.id)
         if config is None:
@@ -132,9 +154,11 @@ class ActivityCog(commands.Cog):
         before: disnake.Member,
         after: disnake.Member,
     ) -> None:
-        await self.ensure_family_member_role(after)
-        if after.guild.id != GUILD_ID or after.id in self.automated_role_removals:
+        if after.guild.id != GUILD_ID:
             return
+        if after.id in self.automated_role_removals:
+            return
+        await self.ensure_family_member_role(after)
         family_role_ids = await self.get_family_role_ids()
         before_family_roles = [role for role in before.roles if role.id in family_role_ids]
         after_family_roles = [role for role in after.roles if role.id in family_role_ids]
@@ -310,7 +334,10 @@ class ActivityCog(commands.Cog):
         )
         if disnake.utils.utcnow() < enforcement_started_at + timedelta(days=7):
             return
-        for profile in await self.bot.database.get_inactive_users():
+        remove_roles = await self.bot.database.get_activity_remove_roles(GUILD_ID)
+        for profile in await self.bot.database.get_inactive_users(
+            notification_only=not remove_roles
+        ):
             member = guild.get_member(profile["discord_id"])
             if member is None:
                 continue
@@ -335,6 +362,19 @@ class ActivityCog(commands.Cog):
                 and role < bot_member.top_role
             ]
             role_names = ", ".join(role.name for role in removable_roles) or "нет доступных для снятия ролей"
+            if not remove_roles:
+                await self.bot.database.record_inactivity_notice(member.id)
+                await send_admin_log(
+                    self.bot,
+                    title="⚠️ Обнаружена неактивность",
+                    description=(
+                        f"Пользователь: {member.mention} (`{member.id}`)\n"
+                        f"Причина: **{reason}**\n"
+                        "Роли не сняты: включён режим уведомлений."
+                    ),
+                    color=disnake.Color.orange(),
+                )
+                continue
             try:
                 self.automated_role_removals.add(member.id)
                 try:

@@ -47,6 +47,8 @@ class Database:
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS inactive_at TIMESTAMPTZ;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity_warning_at TIMESTAMPTZ;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS family_name TEXT;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS last_inactivity_notice_at TIMESTAMPTZ;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS activity_check_after TIMESTAMPTZ;
                 UPDATE users SET is_active=FALSE, inactive_reason=COALESCE(inactive_reason, 'Роли сняты за неактивность'),
                     inactive_at=COALESCE(inactive_at, roles_removed_at) WHERE roles_removed_at IS NOT NULL;
                 ALTER TABLE users DROP COLUMN IF EXISTS kicked_at;
@@ -199,6 +201,11 @@ class Database:
                 CREATE TABLE IF NOT EXISTS bot_settings (
                     key TEXT PRIMARY KEY,
                     value TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS activity_check_config (
+                    guild_id BIGINT PRIMARY KEY,
+                    remove_roles BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 """
             )
@@ -362,6 +369,10 @@ class Database:
                 is_active = CASE WHEN $7 THEN TRUE ELSE is_active END,
                 inactive_reason = CASE WHEN $7 THEN NULL ELSE inactive_reason END,
                 inactive_at = CASE WHEN $7 THEN NULL ELSE inactive_at END,
+                activity_check_after = CASE
+                    WHEN $7 AND is_active=FALSE THEN NOW()+INTERVAL '7 days'
+                    ELSE activity_check_after
+                END,
                 updated_at = NOW()
             WHERE discord_id = $1
             RETURNING *
@@ -466,7 +477,9 @@ class Database:
                     await connection.execute("UPDATE users SET profile_status='В отпуске',updated_at=NOW() WHERE discord_id=$1", request["discord_id"])
                 return request
 
-    async def get_inactive_users(self) -> list[asyncpg.Record]:
+    async def get_inactive_users(
+        self, *, notification_only: bool = False
+    ) -> list[asyncpg.Record]:
         if self.pool is None:
             return []
         await self.pool.execute("""UPDATE users u SET profile_status='Активен',updated_at=NOW()
@@ -479,11 +492,44 @@ class Database:
             FROM users u WHERE COALESCE(u.guild_joined_at,u.created_at)<=NOW()-INTERVAL '7 days'
             AND u.is_active=TRUE AND NOT EXISTS(SELECT 1 FROM leave_requests l
             WHERE l.discord_id=u.discord_id AND l.status='approved' AND l.ends_at>NOW())
+            AND (u.activity_check_after IS NULL OR u.activity_check_after<=NOW())
+            AND (NOT $1::BOOLEAN OR u.last_inactivity_notice_at IS NULL
+                OR u.last_inactivity_notice_at<NOW()-INTERVAL '24 hours')
             AND (COALESCE(u.last_message_at,u.guild_joined_at,u.created_at)
                 <NOW()-INTERVAL '7 days' OR voice_seconds_since(
                     u.discord_id, NOW()-INTERVAL '7 days'
-                )<3600)"""
+                )<3600)""",
+            notification_only,
         )
+
+    async def get_activity_remove_roles(self, guild_id: int) -> bool:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return bool(await self.pool.fetchval(
+            """INSERT INTO activity_check_config(guild_id) VALUES($1)
+            ON CONFLICT(guild_id) DO UPDATE SET guild_id=EXCLUDED.guild_id
+            RETURNING remove_roles""",
+            guild_id,
+        ))
+
+    async def set_activity_remove_roles(self, guild_id: int, enabled: bool) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO activity_check_config(guild_id,remove_roles)
+            VALUES($1,$2) ON CONFLICT(guild_id) DO UPDATE SET
+            remove_roles=EXCLUDED.remove_roles,updated_at=NOW()""",
+            guild_id,
+            enabled,
+        )
+
+    async def record_inactivity_notice(self, discord_id: int) -> None:
+        if self.pool is not None:
+            await self.pool.execute(
+                """UPDATE users SET last_inactivity_notice_at=NOW(),updated_at=NOW()
+                WHERE discord_id=$1""",
+                discord_id,
+            )
 
     async def has_pending_leave(self, discord_id: int) -> bool:
         if self.pool is None:
