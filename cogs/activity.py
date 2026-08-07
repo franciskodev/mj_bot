@@ -8,6 +8,7 @@ from disnake.ext import commands, tasks
 
 from config import (
     ALLOWED_GUILD_IDS,
+    DEFAULT_MEMBER_ROLE_ID,
     FAMILY_MEMBER_ROLE_ID,
     FAMILY_ROLE_IDS_FOR_SYNC,
     GUILD_ID,
@@ -357,6 +358,7 @@ class ActivityCog(commands.Cog):
             removable_roles = [
                 role for role in member.roles
                 if role != guild.default_role
+                and role.id != DEFAULT_MEMBER_ROLE_ID
                 and not role.managed
                 and bot_member is not None
                 and role < bot_member.top_role
@@ -380,6 +382,22 @@ class ActivityCog(commands.Cog):
                 try:
                     if removable_roles:
                         await member.remove_roles(*removable_roles, reason=f"Неактивность: {reason}")
+                    inactive_role = (
+                        guild.get_role(DEFAULT_MEMBER_ROLE_ID)
+                        if DEFAULT_MEMBER_ROLE_ID is not None
+                        else None
+                    )
+                    if inactive_role is None:
+                        logging.error(
+                            "Inactive role %s was not found in guild %s",
+                            DEFAULT_MEMBER_ROLE_ID,
+                            guild.id,
+                        )
+                    elif inactive_role not in member.roles:
+                        await member.add_roles(
+                            inactive_role,
+                            reason=f"Неактивность: {reason}",
+                        )
                     await self.bot.database.deactivate_user(
                         member.id, f"Неактивность: {reason}", roles_removed=True
                     )
