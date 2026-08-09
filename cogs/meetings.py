@@ -201,13 +201,11 @@ class MeetingsCog(commands.Cog):
         name="meeting",
         description="Управление собраниями семьи",
         guild_ids=GUILD_IDS,
-        default_member_permissions=disnake.Permissions(administrator=True),
     )
     async def meeting(self, inter: disnake.ApplicationCommandInteraction) -> None:
         pass
 
     @meeting.sub_command(name="check", description="Проверить явку в голосовом канале")
-    @commands.has_permissions(administrator=True)
     async def meeting_check(
         self,
         inter: disnake.ApplicationCommandInteraction,

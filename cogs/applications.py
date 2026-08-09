@@ -7,7 +7,9 @@ import asyncpg
 import disnake
 from disnake.ext import commands
 
+from access_control import member_access_level
 from config import APPLICATION_LOG_CHANNEL_ID, GUILD_IDS, SERVER_ROLE_IDS
+from cogs.systems import format_blacklist_matches, parse_static_ids
 from log_utils import send_admin_log
 from transcript import save_application_json, save_ticket_transcript
 
@@ -179,6 +181,24 @@ class ApplicationModal(disnake.ui.Modal):
             inter.text_values["goal"].strip(),
             screenshot_url,
         )
+        blacklist_entries = await self.cog.bot.database.find_blacklist_entries(
+            inter.author.id, parse_static_ids(application["static_id"])
+        )
+        if blacklist_entries:
+            matched_ids = format_blacklist_matches(blacklist_entries)
+            await send_admin_log(
+                self.cog.bot,
+                title="🚨 Заявка от пользователя из ЧС",
+                description=(
+                    f"Заявка: `#{application['id']}` в **{self.family_name}**\n"
+                    f"Кандидат: {inter.author.mention} (`{inter.author.id}`)\n"
+                    f"Статик заявки: `{application['static_id']}`\n"
+                    f"Совпавшие записи ЧС: **{matched_ids}**\n\n"
+                    "Информация конфиденциальна и не должна распространяться без "
+                    "одобрения руководства."
+                ),
+                color=disnake.Color.red(),
+            )
         previous = await self.cog.bot.database.get_previous_applications(inter.author.id, application["id"])
         application_json_path = None
         try:
@@ -226,7 +246,6 @@ class ApplicationsCog(commands.Cog):
         name="applications",
         description="Настройка заявок в семью",
         guild_ids=GUILD_IDS,
-        default_member_permissions=disnake.Permissions(administrator=True),
     )
     async def applications(self, inter: disnake.ApplicationCommandInteraction) -> None:
         pass
@@ -269,7 +288,6 @@ class ApplicationsCog(commands.Cog):
         )
 
     @applications.sub_command(name="setup", description="Создать панель заявок")
-    @commands.has_permissions(administrator=True)
     async def applications_setup(
         self,
         inter: disnake.ApplicationCommandInteraction,
@@ -388,17 +406,16 @@ class ApplicationsCog(commands.Cog):
         if inter.guild_id is None:
             return
         config = await self.bot.database.get_application_config(inter.guild_id)
-        reviewer_role_ids = set(config["reviewer_role_ids"]) if config else set()
-        allowed = inter.author.guild_permissions.administrator or any(
-            role.id in reviewer_role_ids for role in inter.author.roles
-        )
-        if not allowed:
+        if await member_access_level(self.bot, inter.author) < 2:
             await inter.response.send_message("Только рекрутёры могут обрабатывать заявки.", ephemeral=True)
             return
         try:
             _, status, raw_id = custom_id.split(":", 2)
             application_id = int(raw_id)
         except ValueError:
+            return
+
+        if status not in {"accepted", "review", "interview", "declined", "delete"}:
             return
 
         if status == "delete":
@@ -421,6 +438,27 @@ class ApplicationsCog(commands.Cog):
                     reason=f"Транскрипт заявки #{application_id} сохранён; удалил {inter.author}"
                 )
             return
+
+        current_application = await self.bot.database.get_application(application_id)
+        if current_application is None:
+            await inter.response.send_message("Заявка не найдена.", ephemeral=True)
+            return
+        if status != "declined":
+            blacklist_entries = await self.bot.database.find_blacklist_entries(
+                current_application["discord_id"],
+                parse_static_ids(current_application["static_id"]),
+            )
+            if blacklist_entries:
+                matched_ids = format_blacklist_matches(blacklist_entries)
+                await inter.response.send_message(
+                    "⛔ Пользователь находится в чёрном списке семьи "
+                    f"(записи: **{matched_ids}**). Это действие заблокировано; "
+                    "доступна только кнопка отказа.\n\n"
+                    "⚠️ Информацию о чёрном списке запрещено распространять без "
+                    "одобрения руководства.",
+                    ephemeral=True,
+                )
+                return
 
         application = await self.bot.database.review_application(application_id, status, inter.author.id)
         if application is None:

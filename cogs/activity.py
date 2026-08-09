@@ -49,9 +49,7 @@ class ActivityCog(commands.Cog):
         name="режим_проверки",
         description="Настроить действие бота при проверке активности",
         guild_ids=[GUILD_ID],
-        default_member_permissions=disnake.Permissions(administrator=True),
     )
-    @commands.has_permissions(administrator=True)
     async def activity_check_mode(
         self,
         inter: disnake.ApplicationCommandInteraction,

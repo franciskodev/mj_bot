@@ -352,13 +352,11 @@ class UsersCog(commands.Cog):
         name="user",
         description="Управление профилями пользователей",
         guild_ids=GUILD_IDS,
-        default_member_permissions=disnake.Permissions(administrator=True),
     )
     async def user(self, inter: disnake.ApplicationCommandInteraction) -> None:
         pass
 
     @user.sub_command(name="add", description="Добавить пользователя в базу данных")
-    @commands.has_permissions(administrator=True)
     async def user_add(
         self,
         inter: disnake.ApplicationCommandInteraction,
@@ -408,7 +406,6 @@ class UsersCog(commands.Cog):
         await send_admin_log(self.bot, title="👤 Пользователь добавлен", description=f"Администратор: {inter.author.mention}\nПользователь: {member.mention} (`{member.id}`)", color=disnake.Color.green())
 
     @user.sub_command(name="edit", description="Изменить профиль пользователя")
-    @commands.has_permissions(administrator=True)
     async def user_edit(
         self,
         inter: disnake.ApplicationCommandInteraction,
@@ -445,7 +442,6 @@ class UsersCog(commands.Cog):
         await send_admin_log(self.bot, title="✏️ Профиль изменён", description=f"Администратор: {inter.author.mention}\nПользователь: {member.mention} (`{member.id}`)")
 
     @user.sub_command(name="view", description="Посмотреть профиль пользователя")
-    @commands.has_permissions(administrator=True)
     async def user_view(
         self,
         inter: disnake.ApplicationCommandInteraction,
@@ -474,7 +470,6 @@ class UsersCog(commands.Cog):
         await send_admin_log(self.bot, title="🔎 Просмотр профиля", description=f"Администратор: {inter.author.mention}\nПользователь: {member.mention} (`{member.id}`)")
 
     @user.sub_command(name="remove", description="Удалить пользователя из базы данных")
-    @commands.has_permissions(administrator=True)
     async def user_remove(
         self,
         inter: disnake.ApplicationCommandInteraction,

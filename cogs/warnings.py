@@ -95,13 +95,11 @@ class WarningsCog(commands.Cog):
         name="warning",
         description="Управление выговорами",
         guild_ids=GUILD_IDS,
-        default_member_permissions=disnake.Permissions(administrator=True),
     )
     async def warning(self, inter: disnake.ApplicationCommandInteraction) -> None:
         pass
 
     @warning.sub_command(name="issue", description="Выдать выговор участнику")
-    @commands.has_permissions(administrator=True)
     async def warning_issue(
         self,
         inter: disnake.ApplicationCommandInteraction,
@@ -136,7 +134,6 @@ class WarningsCog(commands.Cog):
         )
 
     @warning.sub_command(name="list", description="Посмотреть историю выговоров участника")
-    @commands.has_permissions(administrator=True)
     async def warning_list(
         self,
         inter: disnake.ApplicationCommandInteraction,
@@ -160,7 +157,6 @@ class WarningsCog(commands.Cog):
         await inter.response.send_message(embed=embed, ephemeral=True)
 
     @warning.sub_command(name="revoke", description="Снять активный выговор")
-    @commands.has_permissions(administrator=True)
     async def warning_revoke(
         self,
         inter: disnake.ApplicationCommandInteraction,

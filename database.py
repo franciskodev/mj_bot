@@ -209,6 +209,50 @@ class Database:
                     remove_roles BOOLEAN NOT NULL DEFAULT TRUE,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+
+                CREATE TABLE IF NOT EXISTS family_blacklist (
+                    id BIGSERIAL PRIMARY KEY,
+                    discord_id BIGINT,
+                    static_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+                    reason TEXT NOT NULL,
+                    created_by BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    removed_by BIGINT,
+                    removed_at TIMESTAMPTZ,
+                    channel_message_id BIGINT,
+                    CHECK (discord_id IS NOT NULL OR CARDINALITY(static_ids) > 0)
+                );
+                CREATE INDEX IF NOT EXISTS family_blacklist_active_discord_idx
+                    ON family_blacklist(discord_id) WHERE active=TRUE;
+                CREATE INDEX IF NOT EXISTS family_blacklist_active_statics_idx
+                    ON family_blacklist USING GIN(static_ids) WHERE active=TRUE;
+
+                CREATE TABLE IF NOT EXISTS command_access_levels (
+                    guild_id BIGINT NOT NULL,
+                    command_name TEXT NOT NULL,
+                    access_level SMALLINT NOT NULL CHECK(access_level BETWEEN 1 AND 6),
+                    updated_by BIGINT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY(guild_id, command_name)
+                );
+                CREATE TABLE IF NOT EXISTS access_level_roles (
+                    guild_id BIGINT NOT NULL,
+                    access_level SMALLINT NOT NULL CHECK(access_level BETWEEN 1 AND 4),
+                    role_id BIGINT NOT NULL,
+                    added_by BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY(guild_id, access_level, role_id)
+                );
+                CREATE TABLE IF NOT EXISTS department_config (
+                    guild_id BIGINT NOT NULL,
+                    department TEXT NOT NULL CHECK(department IN ('recruiters','contractors')),
+                    member_role_id BIGINT NOT NULL,
+                    head_role_id BIGINT NOT NULL,
+                    updated_by BIGINT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY(guild_id, department)
+                );
                 """
             )
             await connection.execute(
@@ -950,3 +994,162 @@ class Database:
         if self.pool is None:
             return []
         return await self.pool.fetch("SELECT * FROM users WHERE is_active=TRUE")
+
+    async def add_blacklist_entry(
+        self,
+        discord_id: int | None,
+        static_ids: list[str],
+        reason: str,
+        created_by: int,
+    ) -> asyncpg.Record:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetchrow(
+            """INSERT INTO family_blacklist(discord_id,static_ids,reason,created_by)
+            VALUES($1,$2,$3,$4) RETURNING *""",
+            discord_id, static_ids, reason, created_by,
+        )
+
+    async def set_blacklist_message(self, entry_id: int, message_id: int) -> None:
+        if self.pool is not None:
+            await self.pool.execute(
+                "UPDATE family_blacklist SET channel_message_id=$2 WHERE id=$1",
+                entry_id, message_id,
+            )
+
+    async def get_blacklist_entry(self, entry_id: int) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            "SELECT * FROM family_blacklist WHERE id=$1", entry_id
+        )
+
+    async def find_blacklist_entries(
+        self, discord_id: int, static_ids: list[str]
+    ) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        return await self.pool.fetch(
+            """SELECT * FROM family_blacklist WHERE active=TRUE AND
+            (discord_id=$1 OR static_ids && $2::TEXT[])
+            ORDER BY created_at DESC""",
+            discord_id, static_ids,
+        )
+
+    async def remove_blacklist_entry(
+        self, entry_id: int, removed_by: int
+    ) -> asyncpg.Record | None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetchrow(
+            """UPDATE family_blacklist SET active=FALSE,removed_by=$2,removed_at=NOW()
+            WHERE id=$1 AND active=TRUE RETURNING *""",
+            entry_id, removed_by,
+        )
+
+    async def get_command_access_level(
+        self, guild_id: int, command_name: str
+    ) -> int | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchval(
+            """SELECT access_level FROM command_access_levels
+            WHERE guild_id=$1 AND command_name=$2""",
+            guild_id, command_name,
+        )
+
+    async def set_command_access_level(
+        self, guild_id: int, command_name: str, level: int, updated_by: int
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO command_access_levels(
+                guild_id,command_name,access_level,updated_by
+            ) VALUES($1,$2,$3,$4) ON CONFLICT(guild_id,command_name) DO UPDATE SET
+                access_level=EXCLUDED.access_level,updated_by=EXCLUDED.updated_by,
+                updated_at=NOW()""",
+            guild_id, command_name, level, updated_by,
+        )
+
+    async def add_access_role(
+        self, guild_id: int, level: int, role_id: int, added_by: int
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO access_level_roles(guild_id,access_level,role_id,added_by)
+            VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING""",
+            guild_id, level, role_id, added_by,
+        )
+
+    async def remove_access_role(
+        self, guild_id: int, level: int, role_id: int
+    ) -> bool:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        result = await self.pool.execute(
+            """DELETE FROM access_level_roles
+            WHERE guild_id=$1 AND access_level=$2 AND role_id=$3""",
+            guild_id, level, role_id,
+        )
+        return result != "DELETE 0"
+
+    async def get_access_roles(self, guild_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        return await self.pool.fetch(
+            """SELECT * FROM access_level_roles WHERE guild_id=$1
+            ORDER BY access_level,role_id""",
+            guild_id,
+        )
+
+    async def get_highest_role_access_level(
+        self, guild_id: int, role_ids: set[int]
+    ) -> int:
+        if self.pool is None or not role_ids:
+            return 0
+        return int(await self.pool.fetchval(
+            """SELECT COALESCE(MAX(access_level),0) FROM access_level_roles
+            WHERE guild_id=$1 AND role_id=ANY($2::BIGINT[])""",
+            guild_id, list(role_ids),
+        ))
+
+    async def set_department_config(
+        self,
+        guild_id: int,
+        department: str,
+        member_role_id: int,
+        head_role_id: int,
+        updated_by: int,
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO department_config(
+                guild_id,department,member_role_id,head_role_id,updated_by
+            ) VALUES($1,$2,$3,$4,$5) ON CONFLICT(guild_id,department) DO UPDATE SET
+                member_role_id=EXCLUDED.member_role_id,
+                head_role_id=EXCLUDED.head_role_id,
+                updated_by=EXCLUDED.updated_by,updated_at=NOW()""",
+            guild_id, department, member_role_id, head_role_id, updated_by,
+        )
+
+    async def get_department_config(
+        self, guild_id: int, department: str
+    ) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            """SELECT * FROM department_config
+            WHERE guild_id=$1 AND department=$2""",
+            guild_id, department,
+        )
+
+    async def get_department_configs(self, guild_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        return await self.pool.fetch(
+            "SELECT * FROM department_config WHERE guild_id=$1 ORDER BY department",
+            guild_id,
+        )

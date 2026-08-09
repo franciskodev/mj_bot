@@ -93,6 +93,28 @@ class CoreCog(commands.Cog):
                 )
 
     @commands.Cog.listener()
+    async def on_slash_command_error(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        error: commands.CommandError,
+    ) -> None:
+        if isinstance(error, commands.CheckFailure):
+            if not inter.response.is_done():
+                await inter.response.send_message(
+                    "У вас нет прав для выполнения этой команды.", ephemeral=True
+                )
+            return
+        logging.exception(
+            "Slash command %s failed",
+            getattr(inter.data, "name", "unknown"),
+            exc_info=error,
+        )
+        if not inter.response.is_done():
+            await inter.response.send_message(
+                "Не удалось выполнить команду из-за внутренней ошибки.", ephemeral=True
+            )
+
+    @commands.Cog.listener()
     async def on_member_join(self, member: disnake.Member) -> None:
         if member.guild.id != GUILD_ID or member.bot:
             return
