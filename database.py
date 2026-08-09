@@ -198,6 +198,8 @@ class Database:
                     ADD COLUMN IF NOT EXISTS interpolov_role_id BIGINT;
                 ALTER TABLE application_guild_config
                     ADD COLUMN IF NOT EXISTS intolerance_role_id BIGINT;
+                ALTER TABLE application_guild_config
+                    ADD COLUMN IF NOT EXISTS reviewer_role_ids BIGINT[];
                 CREATE TABLE IF NOT EXISTS bot_settings (
                     key TEXT PRIMARY KEY,
                     value TIMESTAMPTZ NOT NULL
@@ -227,10 +229,10 @@ class Database:
                 """INSERT INTO application_guild_config(
                     guild_id,panel_channel_id,category_id,reviewer_role_id,
                     accepted_role_id,panel_message_id,updated_at,
-                    interpolov_role_id,intolerance_role_id
+                    interpolov_role_id,intolerance_role_id,reviewer_role_ids
                 ) SELECT $1,panel_channel_id,category_id,
                     reviewer_role_id,accepted_role_id,panel_message_id,updated_at,
-                    accepted_role_id,accepted_role_id
+                    accepted_role_id,accepted_role_id,ARRAY[reviewer_role_id]
                 FROM application_config WHERE id=1
                 ON CONFLICT(guild_id) DO NOTHING""",
                 GUILD_ID,
@@ -238,12 +240,14 @@ class Database:
             await connection.execute(
                 """UPDATE application_guild_config SET
                     interpolov_role_id=COALESCE(interpolov_role_id,accepted_role_id),
-                    intolerance_role_id=COALESCE(intolerance_role_id,accepted_role_id)"""
+                    intolerance_role_id=COALESCE(intolerance_role_id,accepted_role_id),
+                    reviewer_role_ids=COALESCE(reviewer_role_ids,ARRAY[reviewer_role_id])"""
             )
             await connection.execute(
                 """ALTER TABLE application_guild_config
                     ALTER COLUMN interpolov_role_id SET NOT NULL,
-                    ALTER COLUMN intolerance_role_id SET NOT NULL"""
+                    ALTER COLUMN intolerance_role_id SET NOT NULL,
+                    ALTER COLUMN reviewer_role_ids SET NOT NULL"""
             )
 
         logging.info("Connected to PostgreSQL")
@@ -823,7 +827,7 @@ class Database:
         guild_id: int,
         panel_channel_id: int,
         category_id: int,
-        reviewer_role_id: int,
+        reviewer_role_ids: list[int],
         interpolov_role_id: int,
         intolerance_role_id: int,
     ) -> None:
@@ -831,17 +835,18 @@ class Database:
             raise RuntimeError("Database is not connected")
         await self.pool.execute(
             """INSERT INTO application_guild_config(
-                guild_id,panel_channel_id,category_id,reviewer_role_id,
+                guild_id,panel_channel_id,category_id,reviewer_role_id,reviewer_role_ids,
                 accepted_role_id,interpolov_role_id,intolerance_role_id
-            ) VALUES($1,$2,$3,$4,$6,$5,$6) ON CONFLICT(guild_id) DO UPDATE SET
+            ) VALUES($1,$2,$3,($4::BIGINT[])[1],$4,$6,$5,$6) ON CONFLICT(guild_id) DO UPDATE SET
                 panel_channel_id=EXCLUDED.panel_channel_id,
                 category_id=EXCLUDED.category_id,
                 reviewer_role_id=EXCLUDED.reviewer_role_id,
+                reviewer_role_ids=EXCLUDED.reviewer_role_ids,
                 accepted_role_id=EXCLUDED.accepted_role_id,
                 interpolov_role_id=EXCLUDED.interpolov_role_id,
                 intolerance_role_id=EXCLUDED.intolerance_role_id,
                 updated_at=NOW()""",
-            guild_id, panel_channel_id, category_id, reviewer_role_id,
+            guild_id, panel_channel_id, category_id, reviewer_role_ids,
             interpolov_role_id, intolerance_role_id,
         )
 

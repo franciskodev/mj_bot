@@ -138,8 +138,11 @@ class ApplicationModal(disnake.ui.Modal):
         if guild is None:
             return
         category = guild.get_channel(self.config["category_id"])
-        reviewer_role = guild.get_role(self.config["reviewer_role_id"])
-        if not isinstance(category, disnake.CategoryChannel) or reviewer_role is None or guild.me is None:
+        reviewer_roles = [
+            role for role_id in self.config["reviewer_role_ids"]
+            if (role := guild.get_role(role_id)) is not None
+        ]
+        if not isinstance(category, disnake.CategoryChannel) or not reviewer_roles or guild.me is None:
             await inter.edit_original_response("Настройки тикетов устарели. Сообщите администратору.")
             return
 
@@ -147,9 +150,12 @@ class ApplicationModal(disnake.ui.Modal):
         overwrites = {
             guild.default_role: disnake.PermissionOverwrite(view_channel=False),
             inter.author: disnake.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            reviewer_role: disnake.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             guild.me: disnake.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
         }
+        for reviewer_role in reviewer_roles:
+            overwrites[reviewer_role] = disnake.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True
+            )
         try:
             ticket = await category.create_text_channel(
                 f"{self.family_key}-{safe_name}",
@@ -184,7 +190,7 @@ class ApplicationModal(disnake.ui.Modal):
             logging.exception("Could not save application JSON")
         embed = application_embed(application, inter.author, previous)
         message = await ticket.send(
-            content=f"{reviewer_role.mention} {inter.author.mention}",
+            content=f"{' '.join(role.mention for role in reviewer_roles)} {inter.author.mention}",
             embed=embed,
             components=application_buttons(application["id"]),
         )
@@ -269,20 +275,36 @@ class ApplicationsCog(commands.Cog):
         inter: disnake.ApplicationCommandInteraction,
         panel_channel: disnake.TextChannel = commands.Param(description="Канал с кнопкой подачи заявки"),
         ticket_category: disnake.CategoryChannel = commands.Param(description="Категория приватных тикетов"),
-        reviewer_role: disnake.Role = commands.Param(description="Роль рекрутёров"),
+        reviewer_role_1: disnake.Role = commands.Param(description="Первая роль рекрутёров"),
         interpolov_role: disnake.Role = commands.Param(description="Роль участника INTERPOLOV"),
         intolerance_role: disnake.Role = commands.Param(description="Роль участника INTOLERANCE"),
+        reviewer_role_2: disnake.Role | None = commands.Param(default=None, description="Вторая роль рекрутёров"),
+        reviewer_role_3: disnake.Role | None = commands.Param(default=None, description="Третья роль рекрутёров"),
+        reviewer_role_4: disnake.Role | None = commands.Param(default=None, description="Четвёртая роль рекрутёров"),
+        reviewer_role_5: disnake.Role | None = commands.Param(default=None, description="Пятая роль рекрутёров"),
     ) -> None:
         if inter.guild_id is None:
             return
-        await self.bot.database.save_application_config(
-            inter.guild_id,
-            panel_channel.id,
-            ticket_category.id,
-            reviewer_role.id,
-            interpolov_role.id,
-            intolerance_role.id,
-        )
+        await inter.response.defer(ephemeral=True)
+        reviewer_roles = list(dict.fromkeys(filter(None, (
+            reviewer_role_1, reviewer_role_2, reviewer_role_3,
+            reviewer_role_4, reviewer_role_5,
+        ))))
+        try:
+            await self.bot.database.save_application_config(
+                inter.guild_id,
+                panel_channel.id,
+                ticket_category.id,
+                [role.id for role in reviewer_roles],
+                interpolov_role.id,
+                intolerance_role.id,
+            )
+        except asyncpg.PostgresError:
+            logging.exception("Could not save application configuration")
+            await inter.edit_original_response(
+                "❌ Не удалось сохранить настройки заявок в базе данных."
+            )
+            return
         embed = disnake.Embed(
             title="INTERPOLOV & INTOLERANCE",
             description=(
@@ -306,9 +328,17 @@ class ApplicationsCog(commands.Cog):
                 custom_id="family_application:open:intolerance",
             ),
         ]
-        message = await panel_channel.send(embed=embed, components=buttons)
+        try:
+            message = await panel_channel.send(embed=embed, components=buttons)
+        except disnake.DiscordException:
+            logging.exception("Could not send application panel")
+            await inter.edit_original_response(
+                f"❌ Не удалось отправить панель в {panel_channel.mention}. "
+                "Проверьте право бота **Отправлять сообщения** в этом канале."
+            )
+            return
         await self.bot.database.set_application_panel_message(inter.guild_id, message.id)
-        await inter.response.send_message(f"✅ Панель создана в {panel_channel.mention}.", ephemeral=True)
+        await inter.edit_original_response(f"✅ Панель создана в {panel_channel.mention}.")
         await send_admin_log(
             self.bot,
             title="🧾 Панель заявок настроена",
@@ -316,7 +346,7 @@ class ApplicationsCog(commands.Cog):
                 f"Администратор: {inter.author.mention}\n"
                 f"Канал: {panel_channel.mention}\n"
                 f"Категория: **{ticket_category.name}**\n"
-                f"Рекрутёры: {reviewer_role.mention}\n"
+                f"Рекрутёры: {' '.join(role.mention for role in reviewer_roles)}\n"
                 f"INTERPOLOV: {interpolov_role.mention}\n"
                 f"INTOLERANCE: {intolerance_role.mention}"
             ),
@@ -358,9 +388,9 @@ class ApplicationsCog(commands.Cog):
         if inter.guild_id is None:
             return
         config = await self.bot.database.get_application_config(inter.guild_id)
-        reviewer_role = inter.guild.get_role(config["reviewer_role_id"]) if config and inter.guild else None
-        allowed = inter.author.guild_permissions.administrator or (
-            reviewer_role is not None and reviewer_role in inter.author.roles
+        reviewer_role_ids = set(config["reviewer_role_ids"]) if config else set()
+        allowed = inter.author.guild_permissions.administrator or any(
+            role.id in reviewer_role_ids for role in inter.author.roles
         )
         if not allowed:
             await inter.response.send_message("Только рекрутёры могут обрабатывать заявки.", ephemeral=True)
@@ -397,6 +427,14 @@ class ApplicationsCog(commands.Cog):
             await inter.response.send_message("Заявка уже закрыта.", ephemeral=True)
             return
         applicant = inter.guild.get_member(application["discord_id"]) if inter.guild else None
+        if applicant is None and inter.guild is not None:
+            try:
+                applicant = await inter.guild.fetch_member(application["discord_id"])
+            except disnake.DiscordException:
+                logging.warning(
+                    "Could not fetch applicant %s for application %s",
+                    application["discord_id"], application_id,
+                )
         if status == "accepted" and applicant is not None and config is not None:
             role_column = (
                 "interpolov_role_id"
