@@ -242,6 +242,129 @@ class ApplicationsCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
 
+    async def _decline_departed_member_application(
+        self, member: disnake.Member, application: asyncpg.Record
+    ) -> None:
+        application_id = application["id"]
+        channel = self.bot.get_channel(application["ticket_channel_id"])
+        if channel is None and application["ticket_channel_id"] is not None:
+            try:
+                channel = await self.bot.fetch_channel(application["ticket_channel_id"])
+            except disnake.DiscordException:
+                logging.exception(
+                    "Could not fetch ticket channel for automatically declined application %s",
+                    application_id,
+                )
+
+        if isinstance(channel, disnake.TextChannel):
+            if application["ticket_message_id"] is not None:
+                try:
+                    message = await channel.fetch_message(application["ticket_message_id"])
+                    if message.embeds:
+                        embed = message.embeds[0]
+                        embed.color = disnake.Color.red()
+                        status_index = next(
+                            (
+                                index
+                                for index, field in enumerate(embed.fields)
+                                if field.name == "📌 Статус"
+                            ),
+                            None,
+                        )
+                        status_value = (
+                            "**Отклонён**\nАвтоматически: пользователь покинул сервер"
+                        )
+                        if status_index is None:
+                            embed.add_field(
+                                name="📌 Статус", value=status_value, inline=False
+                            )
+                        else:
+                            embed.set_field_at(
+                                status_index,
+                                name="📌 Статус",
+                                value=status_value,
+                                inline=False,
+                            )
+                        await message.edit(embed=embed, components=[])
+                    else:
+                        await message.edit(components=[])
+                except disnake.DiscordException:
+                    logging.exception(
+                        "Could not update ticket message for automatically declined application %s",
+                        application_id,
+                    )
+
+            try:
+                await channel.send(
+                    f"❌ Заявка **#{application_id}** автоматически отклонена: "
+                    "пользователь покинул сервер."
+                )
+                transcript_path = await save_ticket_transcript(channel, application)
+                await self.bot.database.set_application_transcript(
+                    application_id, str(transcript_path)
+                )
+
+                application_log_channel = self.bot.get_channel(APPLICATION_LOG_CHANNEL_ID)
+                if application_log_channel is None:
+                    application_log_channel = await self.bot.fetch_channel(
+                        APPLICATION_LOG_CHANNEL_ID
+                    )
+                if isinstance(
+                    application_log_channel, (disnake.TextChannel, disnake.Thread)
+                ):
+                    await application_log_channel.send(
+                        content=(
+                            f"📚 **Транскрипт заявки #{application_id}** · Отклонён "
+                            f"автоматически · тикет {channel.mention}"
+                        ),
+                        file=disnake.File(
+                            str(transcript_path),
+                            filename=f"application-{application_id}.json",
+                        ),
+                    )
+
+                await channel.send(
+                    content=(
+                        "✅ Заявка отклонена, транскрипт сохранен. "
+                        "Теперь тикет можно удалить."
+                    ),
+                    components=[
+                        disnake.ui.Button(
+                            label="Удалить тикет",
+                            emoji="🗑️",
+                            style=disnake.ButtonStyle.danger,
+                            custom_id=f"application:delete:{application_id}",
+                        )
+                    ],
+                )
+            except Exception:
+                logging.exception(
+                    "Could not finalize automatically declined application %s",
+                    application_id,
+                )
+
+        await send_admin_log(
+            self.bot,
+            title=f"🧾 Заявка #{application_id}: Отклонён автоматически",
+            description=(
+                f"Кандидат: {member} (`{member.id}`)\n"
+                "Причина: **пользователь покинул сервер**"
+            ),
+            color=disnake.Color.red(),
+        )
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: disnake.Member) -> None:
+        if member.guild.id not in GUILD_IDS or self.bot.user is None:
+            return
+        applications = (
+            await self.bot.database.decline_open_applications_for_departed_member(
+                member.id, member.guild.id, self.bot.user.id
+            )
+        )
+        for application in applications:
+            await self._decline_departed_member_application(member, application)
+
     @commands.slash_command(
         name="applications",
         description="Настройка заявок в семью",
@@ -512,6 +635,7 @@ class ApplicationsCog(commands.Cog):
                     await self.bot.database.set_user_family(
                         applicant.id, application["family_name"]
                     )
+                    self.bot.dispatch("voice_eligibility_changed")
             else:
                 logging.error(
                     "Accepted applicant %s was not saved: family role is missing",

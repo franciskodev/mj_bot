@@ -51,6 +51,7 @@ DEFAULT_COMMAND_LEVELS = {
 
 # Эти команды нельзя ослабить пользовательской настройкой.
 PROTECTED_COMMAND_LEVELS = {
+    "режим_проверки": 4,
     "blacklist add": 5,
     "access command": 5,
     "access role_add": 5,

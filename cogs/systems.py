@@ -1,6 +1,8 @@
+import asyncio
 import io
 import logging
 import re
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterable
 
 import disnake
@@ -111,6 +113,16 @@ def blacklist_remove_button(entry_id: int) -> disnake.ui.Button:
     )
 
 
+def blacklist_statics_file(entry) -> disnake.File | None:
+    all_statics = "; ".join(f"#{static_id}" for static_id in entry["static_ids"])
+    if len(all_statics) <= 3000:
+        return None
+    return disnake.File(
+        io.BytesIO(all_statics.encode("utf-8")),
+        filename=f"blacklist-{entry['id']}-statics.txt",
+    )
+
+
 def flatten_commands(commands_list: Iterable) -> list:
     result = []
     for command in commands_list:
@@ -183,6 +195,226 @@ class SystemsCog(commands.Cog):
             return None
         return channel
 
+    async def publish_blacklist_entry(self, entry, *, removed: bool) -> bool:
+        channel = await self.get_blacklist_channel()
+        if channel is None:
+            logging.error(
+                "Could not republish blacklist entry %s: channel is unavailable",
+                entry["id"],
+            )
+            return False
+        try:
+            message = await channel.send(
+                embed=blacklist_embed(entry, removed=removed),
+                components=[] if removed else [blacklist_remove_button(entry["id"])],
+                file=blacklist_statics_file(entry),
+            )
+            await self.bot.database.set_blacklist_message(entry["id"], message.id)
+            return True
+        except disnake.DiscordException:
+            logging.exception("Could not republish blacklist entry %s", entry["id"])
+            return False
+
+    async def find_blacklist_message_deleter(
+        self,
+        guild: disnake.Guild,
+        action: disnake.AuditLogAction,
+    ) -> disnake.Member | None:
+        for attempt in range(4):
+            if attempt:
+                await asyncio.sleep(1)
+            try:
+                async for audit_entry in guild.audit_logs(limit=8, action=action):
+                    age = (
+                        datetime.now(timezone.utc) - audit_entry.created_at
+                    ).total_seconds()
+                    if age > 20:
+                        break
+                    if action is disnake.AuditLogAction.message_delete:
+                        channel = getattr(audit_entry.extra, "channel", None)
+                        target_id = getattr(audit_entry.target, "id", None)
+                        if (
+                            getattr(channel, "id", None) != BLACKLIST_CHANNEL_ID
+                            or self.bot.user is None
+                            or target_id != self.bot.user.id
+                        ):
+                            continue
+                    elif getattr(audit_entry.target, "id", None) != BLACKLIST_CHANNEL_ID:
+                        continue
+                    actor_id = getattr(audit_entry.user, "id", None)
+                    if actor_id is None:
+                        continue
+                    member = guild.get_member(actor_id)
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(actor_id)
+                        except disnake.DiscordException:
+                            return None
+                    return member
+            except disnake.DiscordException:
+                logging.exception("Could not read audit log for deleted blacklist post")
+                return None
+        return None
+
+    async def punish_unauthorized_blacklist_deletion(
+        self,
+        member: disnake.Member,
+        entries,
+    ) -> None:
+        bot_member = member.guild.me
+        removable_roles = [
+            role
+            for role in member.roles
+            if not role.is_default()
+            and not role.managed
+            and bot_member is not None
+            and role < bot_member.top_role
+        ]
+        removed_roles: list[disnake.Role] = []
+        role_errors: list[str] = []
+        for role in removable_roles:
+            try:
+                await member.remove_roles(
+                    role,
+                    reason="Несанкционированное удаление сообщения чёрного списка",
+                )
+                removed_roles.append(role)
+            except disnake.DiscordException as error:
+                logging.exception(
+                    "Could not remove role %s after unauthorized blacklist deletion",
+                    role.id,
+                )
+                role_errors.append(f"{role.mention}: {error}")
+
+        removed_role_text = (
+            ", ".join(role.mention for role in removed_roles)
+            if removed_roles
+            else "ничего не снято"
+        )
+        unavailable_roles = [
+            role
+            for role in member.roles
+            if not role.is_default() and role not in removable_roles
+        ]
+        unavailable_text = (
+            "\nНедоступны для снятия: "
+            + ", ".join(role.mention for role in unavailable_roles)
+            if unavailable_roles
+            else ""
+        )
+        error_text = (
+            f"\nОшибки Discord: `{'; '.join(role_errors)[:500]}`"
+            if role_errors
+            else ""
+        )
+        restored_ids = []
+        for entry in entries:
+            if await self.publish_blacklist_entry(entry, removed=False):
+                restored_ids.append(entry["id"])
+        entry_ids = [entry["id"] for entry in entries]
+        await send_admin_log(
+            self.bot,
+            title="🚨 Несанкционированное удаление сообщения ЧС",
+            description=(
+                f"Нарушитель: {member.mention} (`{member.id}`)\n"
+                f"Записи: **{', '.join(f'#{entry_id}' for entry_id in entry_ids)}**\n"
+                f"Снятые роли: {removed_role_text}"
+                f"{unavailable_text}{error_text}\n"
+                "Записи остались активными.\n"
+                f"Восстановленные сообщения: **{', '.join(f'#{entry_id}' for entry_id in restored_ids) or 'нет'}**."
+            ),
+            color=disnake.Color.red(),
+        )
+
+    async def handle_deleted_blacklist_messages(
+        self,
+        guild: disnake.Guild,
+        message_ids: Iterable[int],
+        audit_action: disnake.AuditLogAction,
+    ) -> None:
+        entries = []
+        for message_id in message_ids:
+            entry = await self.bot.database.get_active_blacklist_entry_by_message(
+                message_id
+            )
+            if entry is not None:
+                entries.append(entry)
+        if not entries:
+            return
+
+        deleter = await self.find_blacklist_message_deleter(guild, audit_action)
+        is_administrator = (
+            deleter is not None and deleter.guild_permissions.administrator
+        )
+        if is_administrator:
+            for original_entry in entries:
+                entry = await self.bot.database.remove_blacklist_entry(
+                    original_entry["id"], deleter.id
+                )
+                if entry is None:
+                    continue
+                await self.publish_blacklist_entry(entry, removed=True)
+                await send_admin_log(
+                    self.bot,
+                    title=f"✅ Снятие с ЧС #{entry['id']} удалением сообщения",
+                    description=(
+                        f"Администратор: {deleter.mention} (`{deleter.id}`)\n"
+                        "Исходное сообщение записи было удалено."
+                    ),
+                    color=disnake.Color.green(),
+                )
+            return
+
+        if deleter is not None:
+            await self.punish_unauthorized_blacklist_deletion(deleter, entries)
+            return
+
+        restored_ids = []
+        for entry in entries:
+            if await self.publish_blacklist_entry(entry, removed=False):
+                restored_ids.append(entry["id"])
+
+        await send_admin_log(
+            self.bot,
+            title="⚠️ Не удалось определить удалившего сообщение ЧС",
+            description=(
+                f"Записи: **{', '.join(f'#{entry['id']}' for entry in entries)}**\n"
+                f"Восстановлены: **{', '.join(f'#{entry_id}' for entry_id in restored_ids) or 'нет'}**\n"
+                "Записи оставлены активными. Проверьте право бота «Просмотр журнала аудита»."
+            ),
+            color=disnake.Color.orange(),
+        )
+
+    @commands.Cog.listener("on_raw_message_delete")
+    async def blacklist_message_delete(
+        self, payload: disnake.RawMessageDeleteEvent
+    ) -> None:
+        if payload.channel_id != BLACKLIST_CHANNEL_ID or payload.guild_id is None:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        await self.handle_deleted_blacklist_messages(
+            guild,
+            [payload.message_id],
+            disnake.AuditLogAction.message_delete,
+        )
+
+    @commands.Cog.listener("on_raw_bulk_message_delete")
+    async def blacklist_bulk_message_delete(
+        self, payload: disnake.RawBulkMessageDeleteEvent
+    ) -> None:
+        if payload.channel_id != BLACKLIST_CHANNEL_ID or payload.guild_id is None:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+        await self.handle_deleted_blacklist_messages(
+            guild,
+            payload.message_ids,
+            disnake.AuditLogAction.message_bulk_delete,
+        )
+
     @commands.slash_command(
         name="blacklist",
         description="Управление чёрным списком семьи",
@@ -239,20 +471,10 @@ class SystemsCog(commands.Cog):
             parsed_discord_id, parsed_statics, reason, inter.author.id
         )
         try:
-            all_statics = "; ".join(
-                f"#{static_id}" for static_id in entry["static_ids"]
-            )
             message = await channel.send(
                 embed=blacklist_embed(entry),
                 components=[blacklist_remove_button(entry["id"])],
-                file=(
-                    disnake.File(
-                        io.BytesIO(all_statics.encode("utf-8")),
-                        filename=f"blacklist-{entry['id']}-statics.txt",
-                    )
-                    if len(all_statics) > 3000
-                    else None
-                ),
+                file=blacklist_statics_file(entry),
             )
             await self.bot.database.set_blacklist_message(entry["id"], message.id)
         except disnake.DiscordException:
@@ -375,8 +597,12 @@ class SystemsCog(commands.Cog):
                 for option in options
             )
             marker = "✅" if own_level >= level else "🔒"
+            usage = f"/{command.qualified_name}"
+            if syntax:
+                usage += f" {syntax}"
+            escaped_usage = usage.replace("_", "\\_")
             entries.append(
-                f"{marker} **/{command.qualified_name}** {syntax}\n"
+                f"{marker} **{escaped_usage}**\n"
                 f"{command.description}\n"
                 f"Доступ: **{level} — {ACCESS_LEVEL_NAMES[level]}**"
             )
@@ -430,6 +656,21 @@ class SystemsCog(commands.Cog):
         if command_name not in valid_commands:
             await inter.response.send_message(
                 "Команда не найдена. Скопируйте её полное имя из `/help`.", ephemeral=True
+            )
+            return
+        current_level = await command_access_level(
+            self.bot, inter.guild_id, command_name
+        )
+        author_level = (
+            await member_access_level(self.bot, inter.author)
+            if isinstance(inter.author, disnake.Member)
+            else 0
+        )
+        if current_level == 6 and author_level < 6 and level != 6:
+            await inter.response.send_message(
+                "Команда защищена уровнем **6 — Разработчик**. Только разработчик "
+                "может понизить её уровень доступа.",
+                ephemeral=True,
             )
             return
         protected_level = PROTECTED_COMMAND_LEVELS.get(command_name)

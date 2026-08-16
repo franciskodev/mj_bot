@@ -1,4 +1,6 @@
 import logging
+import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import disnake
@@ -10,6 +12,28 @@ if TYPE_CHECKING:
     from bot import IntoleranceBot
 
 
+DM_REPLY_TEXT = "иди нахуй"
+DM_TRIGGER_WORDS_PATH = Path(__file__).resolve().parent.parent / "dm_trigger_words.txt"
+
+
+def load_dm_trigger_words() -> frozenset[str]:
+    return frozenset(
+        word.strip().casefold()
+        for word in DM_TRIGGER_WORDS_PATH.read_text(encoding="utf-8").split(",")
+        if word.strip()
+    )
+
+
+DM_TRIGGER_WORDS = load_dm_trigger_words()
+DM_TRIGGER_PATTERN = re.compile(
+    rf"(?<!\w)(?:{'|'.join(re.escape(word) for word in sorted(DM_TRIGGER_WORDS, key=len, reverse=True))})(?!\w)"
+)
+
+
+def contains_dm_trigger_word(content: str) -> bool:
+    return DM_TRIGGER_PATTERN.search(content.casefold()) is not None
+
+
 class DirectMessagesCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
@@ -18,6 +42,12 @@ class DirectMessagesCog(commands.Cog):
     async def on_message(self, message: disnake.Message) -> None:
         if message.author.bot or not isinstance(message.channel, disnake.DMChannel):
             return
+
+        if contains_dm_trigger_word(message.content):
+            try:
+                await message.channel.send(DM_REPLY_TEXT)
+            except disnake.DiscordException:
+                logging.exception("Could not send automatic DM reply to %s", message.author.id)
 
         await self.forward_dm(message)
 

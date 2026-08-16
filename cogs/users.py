@@ -7,7 +7,7 @@ import asyncpg
 import disnake
 from disnake.ext import commands, tasks
 
-from config import GUILD_ID, GUILD_IDS, SERVER_ROLE_IDS
+from config import GUILD_ID, GUILD_IDS, SERVER_ROLE_IDS, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -398,6 +398,7 @@ class UsersCog(commands.Cog):
             reactivate=True,
         )
         profile = await self.bot.database.set_user_family(member.id, family)
+        self.bot.dispatch("voice_eligibility_changed")
         await inter.response.send_message(
             content=f"✅ Профиль {member.mention} добавлен или обновлён.",
             embed=profile_embed(member, profile) if profile else None,
@@ -415,7 +416,7 @@ class UsersCog(commands.Cog):
         status: str | None = commands.Param(
             default=None,
             description="Статус профиля",
-            choices=["Активен", "В отпуске", "Неактивен"],
+            choices=["Активен", "Неактивен"],
         ),
         bio: str | None = commands.Param(default=None, description="Описание профиля", max_length=500),
     ) -> None:
@@ -427,13 +428,50 @@ class UsersCog(commands.Cog):
             )
             return
 
-        profile = await self.bot.database.update_user_profile(
-            member.id,
-            game_nickname=nickname,
-            server_name=server,
-            profile_status=status,
-            bio=bio,
-        )
+        eligibility_changed = False
+        if status == "Неактивен":
+            eligibility_changed = bool(profile["is_active"])
+            await self.bot.database.deactivate_user(
+                member.id,
+                f"Деактивирован администратором {inter.author}",
+            )
+            profile = await self.bot.database.update_user_profile(
+                member.id,
+                game_nickname=nickname,
+                server_name=server,
+                profile_status=status,
+                bio=bio,
+            )
+        else:
+            reactivate = status == "Активен" and not profile["is_active"]
+            if reactivate and not member.guild_permissions.administrator:
+                family_role_ids = set(TARGET_ROLE_IDS)
+                config = await self.bot.database.get_application_config(GUILD_ID)
+                if config is not None:
+                    family_role_ids.update(
+                        {
+                            config["interpolov_role_id"],
+                            config["intolerance_role_id"],
+                        }
+                    )
+                if not any(role.id in family_role_ids for role in member.roles):
+                    await inter.response.send_message(
+                        "Нельзя реактивировать профиль без семейной роли. "
+                        "Сначала верните участнику роль семьи.",
+                        ephemeral=True,
+                    )
+                    return
+            eligibility_changed = reactivate
+            profile = await self.bot.database.update_user_profile(
+                member.id,
+                game_nickname=nickname,
+                server_name=server,
+                profile_status=status,
+                bio=bio,
+                reactivate=reactivate,
+            )
+        if eligibility_changed:
+            self.bot.dispatch("voice_eligibility_changed")
         await inter.response.send_message(
             content=f"✏️ Профиль {member.mention} обновлён. Для очистки поля укажите `-`.",
             embed=profile_embed(member, profile) if profile else None,

@@ -1,5 +1,7 @@
+import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+from time import monotonic
 
 import asyncpg
 import disnake
@@ -7,20 +9,72 @@ import disnake
 from config import DATABASE_URL, GUILD_ID, TARGET_ROLE_IDS
 
 
+VOICE_SESSION_LOCK_ID = 0x564F494345
+VOICE_INSTANCE_LOCK_ID = 0x564F494346
+INSTANCE_LOCK_HEARTBEAT_SECONDS = 5
+
+
+class BotInstanceLockLost(RuntimeError):
+    pass
+
+
 class Database:
     def __init__(self) -> None:
         self.pool: asyncpg.Pool | None = None
+        self._instance_lock_connection: asyncpg.Connection | None = None
+        self._instance_lock_check = asyncio.Lock()
+        self._last_instance_lock_check_monotonic: float | None = None
 
     async def connect(self) -> None:
+        try:
+            await self._connect()
+        except BaseException:
+            try:
+                await self._cleanup_failed_connect()
+            except Exception:
+                logging.exception("Could not clean up a failed database startup")
+            raise
+
+    async def _cleanup_failed_connect(self) -> None:
+        pool = self.pool
+        self.pool = None
+        self._last_instance_lock_check_monotonic = None
+        try:
+            if pool is not None:
+                await pool.close()
+        finally:
+            lock_connection = self._instance_lock_connection
+            self._instance_lock_connection = None
+            if lock_connection is not None and not lock_connection.is_closed():
+                await lock_connection.close()
+
+    async def _connect(self) -> None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is missing. Add it to your .env file.")
 
-        self.pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=1,
-            max_size=10,
-            command_timeout=30,
-        )
+        lock_connection = await asyncpg.connect(DATABASE_URL, command_timeout=30)
+        self._instance_lock_connection = lock_connection
+        try:
+            lock_acquired = await lock_connection.fetchval(
+                "SELECT pg_try_advisory_lock($1)", VOICE_INSTANCE_LOCK_ID
+            )
+            if not lock_acquired:
+                raise RuntimeError(
+                    "Another bot instance is already using this database"
+                )
+            self._last_instance_lock_check_monotonic = monotonic()
+            self.pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                command_timeout=30,
+            )
+        except BaseException:
+            if not lock_connection.is_closed():
+                await lock_connection.close()
+            self._instance_lock_connection = None
+            self._last_instance_lock_check_monotonic = None
+            raise
 
         async with self.pool.acquire() as connection:
             await connection.execute(
@@ -59,10 +113,86 @@ class Database:
                     discord_id BIGINT NOT NULL REFERENCES users(discord_id) ON DELETE CASCADE,
                     channel_id BIGINT NOT NULL,
                     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     ended_at TIMESTAMPTZ,
                     duration_seconds INTEGER
                 );
+                ALTER TABLE voice_sessions
+                    ADD COLUMN IF NOT EXISTS last_observed_at TIMESTAMPTZ;
+                UPDATE voice_sessions SET last_observed_at=GREATEST(
+                    started_at, COALESCE(ended_at, started_at)
+                ) WHERE last_observed_at IS NULL;
+                UPDATE voice_sessions SET last_observed_at=started_at
+                WHERE last_observed_at<started_at;
+                ALTER TABLE voice_sessions
+                    ALTER COLUMN last_observed_at SET DEFAULT NOW(),
+                    ALTER COLUMN last_observed_at SET NOT NULL;
+                UPDATE voice_sessions SET
+                    ended_at=started_at,
+                    duration_seconds=0
+                WHERE ended_at<started_at;
+                UPDATE voice_sessions SET duration_seconds=0
+                WHERE duration_seconds<0;
+                DO $migration$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname='voice_sessions_valid_end'
+                          AND conrelid='voice_sessions'::REGCLASS
+                    ) THEN
+                        ALTER TABLE voice_sessions ADD CONSTRAINT
+                            voice_sessions_valid_end CHECK (
+                                ended_at IS NULL OR ended_at>=started_at
+                            );
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname='voice_sessions_valid_observation'
+                          AND conrelid='voice_sessions'::REGCLASS
+                    ) THEN
+                        ALTER TABLE voice_sessions ADD CONSTRAINT
+                            voice_sessions_valid_observation CHECK (
+                                last_observed_at>=started_at
+                            );
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname='voice_sessions_valid_duration'
+                          AND conrelid='voice_sessions'::REGCLASS
+                    ) THEN
+                        ALTER TABLE voice_sessions ADD CONSTRAINT
+                            voice_sessions_valid_duration CHECK (
+                                duration_seconds IS NULL OR duration_seconds>=0
+                            );
+                    END IF;
+                END;
+                $migration$;
+                WITH duplicate_open_sessions AS (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY discord_id ORDER BY started_at DESC, id DESC
+                    ) AS position
+                    FROM voice_sessions WHERE ended_at IS NULL
+                )
+                UPDATE voice_sessions AS session SET
+                    ended_at=GREATEST(
+                        session.started_at,
+                        LEAST(
+                            session.last_observed_at+INTERVAL '3 minutes', NOW()
+                        )
+                    ),
+                    duration_seconds=GREATEST(0, EXTRACT(EPOCH FROM(
+                        GREATEST(
+                            session.started_at,
+                            LEAST(
+                                session.last_observed_at+INTERVAL '3 minutes', NOW()
+                            )
+                        )-session.started_at
+                    ))::INTEGER)
+                FROM duplicate_open_sessions AS duplicate
+                WHERE session.id=duplicate.id AND duplicate.position>1;
                 CREATE INDEX IF NOT EXISTS voice_sessions_user_started_idx ON voice_sessions(discord_id, started_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS voice_sessions_one_open_user_idx
+                    ON voice_sessions(discord_id) WHERE ended_at IS NULL;
                 CREATE OR REPLACE FUNCTION voice_seconds_since(
                     target_discord_id BIGINT,
                     since_at TIMESTAMPTZ
@@ -72,10 +202,16 @@ class Database:
                     ))), 0)::BIGINT
                     FROM UNNEST((SELECT RANGE_AGG(TSTZRANGE(
                         GREATEST(started_at, since_at),
-                        LEAST(COALESCE(ended_at, NOW()), NOW()), '[)'
+                        LEAST(COALESCE(
+                            ended_at,
+                            last_observed_at+INTERVAL '3 minutes'
+                        ), NOW()), '[)'
                     )) FROM voice_sessions
                     WHERE discord_id=target_discord_id
-                      AND COALESCE(ended_at, NOW())>since_at
+                      AND LEAST(COALESCE(
+                          ended_at,
+                          last_observed_at+INTERVAL '3 minutes'
+                      ), NOW())>GREATEST(started_at, since_at)
                       AND started_at<NOW())) AS session_range;
                 $$;
 
@@ -227,6 +363,8 @@ class Database:
                     ON family_blacklist(discord_id) WHERE active=TRUE;
                 CREATE INDEX IF NOT EXISTS family_blacklist_active_statics_idx
                     ON family_blacklist USING GIN(static_ids) WHERE active=TRUE;
+                CREATE INDEX IF NOT EXISTS family_blacklist_active_message_idx
+                    ON family_blacklist(channel_message_id) WHERE active=TRUE;
 
                 CREATE TABLE IF NOT EXISTS command_access_levels (
                     guild_id BIGINT NOT NULL,
@@ -296,16 +434,86 @@ class Database:
 
         logging.info("Connected to PostgreSQL")
 
-    async def close(self) -> None:
+    async def ensure_instance_lock(self, *, force: bool = False) -> None:
+        async with self._instance_lock_check:
+            connection = self._instance_lock_connection
+            last_check = self._last_instance_lock_check_monotonic
+            if connection is None or connection.is_closed():
+                self._last_instance_lock_check_monotonic = None
+                raise BotInstanceLockLost("The bot instance lock connection was lost")
+            if (
+                not force
+                and last_check is not None
+                and monotonic() - last_check < INSTANCE_LOCK_HEARTBEAT_SECONDS
+            ):
+                return
+            try:
+                await connection.execute("SELECT 1")
+            except Exception as error:
+                self._last_instance_lock_check_monotonic = None
+                raise BotInstanceLockLost(
+                    "The bot instance lock connection was lost"
+                ) from error
+            self._last_instance_lock_check_monotonic = monotonic()
+
+    async def close_voice_sessions(
+        self, observed_at: datetime | None = None
+    ) -> None:
+        """Close every open voice lease at a bounded observation time."""
         if self.pool is None:
             return
+        await self.ensure_instance_lock(force=True)
+        if observed_at is None:
+            observed_at = datetime.now(timezone.utc)
 
-        await self.pool.execute("""UPDATE voice_sessions SET ended_at=NOW(),
-            duration_seconds=GREATEST(0,EXTRACT(EPOCH FROM(NOW()-started_at))::INTEGER)
-            WHERE ended_at IS NULL""")
-        await self.pool.close()
-        self.pool = None
-        logging.info("PostgreSQL connection pool closed")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1)", VOICE_SESSION_LOCK_ID
+                )
+                await connection.execute(
+                    """UPDATE voice_sessions SET
+                    ended_at=GREATEST(started_at,LEAST(
+                        last_observed_at+INTERVAL '3 minutes',$1::TIMESTAMPTZ,NOW()
+                    )),
+                    duration_seconds=GREATEST(0,EXTRACT(EPOCH FROM(
+                        GREATEST(started_at,LEAST(
+                            last_observed_at+INTERVAL '3 minutes',
+                            $1::TIMESTAMPTZ,NOW()
+                        ))-started_at
+                    ))::INTEGER) WHERE ended_at IS NULL""",
+                    observed_at,
+                )
+
+    async def close(self, observed_at: datetime | None = None) -> None:
+        if self.pool is None and self._instance_lock_connection is None:
+            return
+
+        pool = self.pool
+        try:
+            if pool is not None:
+                await self.close_voice_sessions(observed_at)
+        finally:
+            try:
+                if pool is not None:
+                    try:
+                        await pool.close()
+                    finally:
+                        self.pool = None
+            finally:
+                lock_connection = self._instance_lock_connection
+                self._instance_lock_connection = None
+                self._last_instance_lock_check_monotonic = None
+                if lock_connection is not None and not lock_connection.is_closed():
+                    try:
+                        await lock_connection.execute(
+                            "SELECT pg_advisory_unlock($1)", VOICE_INSTANCE_LOCK_ID
+                        )
+                    except Exception:
+                        logging.exception("Could not release the bot instance lock")
+                    finally:
+                        await lock_connection.close()
+        logging.info("PostgreSQL connections closed")
 
     async def save_users(
         self,
@@ -356,6 +564,7 @@ class Database:
             )
         except asyncpg.PostgresError:
             logging.exception("Could not save users to PostgreSQL")
+            raise
 
     async def get_user(self, discord_id: int) -> asyncpg.Record | None:
         if self.pool is None:
@@ -439,50 +648,179 @@ class Database:
     ) -> bool:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
-        was_active = await self.pool.fetchval(
-            "SELECT is_active FROM users WHERE discord_id=$1", discord_id
-        )
-        if was_active is None:
-            return False
-        await self.pool.execute(
-            """UPDATE users SET is_active=FALSE,profile_status='Неактивен',
-            inactive_reason=$2,inactive_at=NOW(),updated_at=NOW(),
-            roles_removed_at=CASE WHEN $3 THEN NOW() ELSE roles_removed_at END
-            WHERE discord_id=$1""",
-            discord_id, reason, roles_removed,
-        )
-        return bool(was_active)
+        await self.ensure_instance_lock()
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1)", VOICE_SESSION_LOCK_ID
+                )
+                was_active = await connection.fetchval(
+                    "SELECT is_active FROM users WHERE discord_id=$1", discord_id
+                )
+                if was_active is None:
+                    return False
+                await connection.execute(
+                    """UPDATE users SET is_active=FALSE,profile_status='Неактивен',
+                    inactive_reason=$2,inactive_at=NOW(),updated_at=NOW(),
+                    roles_removed_at=CASE WHEN $3 THEN NOW() ELSE roles_removed_at END
+                    WHERE discord_id=$1""",
+                    discord_id,
+                    reason,
+                    roles_removed,
+                )
+                await connection.execute(
+                    """WITH underfilled_channels AS (
+                        SELECT session.channel_id
+                        FROM voice_sessions AS session
+                        JOIN users ON users.discord_id=session.discord_id
+                        WHERE session.ended_at IS NULL
+                        GROUP BY session.channel_id
+                        HAVING COUNT(*) FILTER (WHERE users.is_active)<2
+                    )
+                    UPDATE voice_sessions AS session SET
+                    ended_at=GREATEST(session.started_at,LEAST(
+                        session.last_observed_at+INTERVAL '3 minutes',NOW()
+                    )),
+                    duration_seconds=GREATEST(0,EXTRACT(EPOCH FROM(
+                        GREATEST(session.started_at,LEAST(
+                            session.last_observed_at+INTERVAL '3 minutes',NOW()
+                        ))-session.started_at
+                    ))::INTEGER)
+                    WHERE session.ended_at IS NULL AND (
+                        NOT EXISTS(
+                            SELECT 1 FROM users
+                            WHERE users.discord_id=session.discord_id
+                              AND users.is_active
+                        )
+                        OR session.channel_id IN (
+                            SELECT channel_id FROM underfilled_channels
+                        )
+                    )"""
+                )
+                return bool(was_active)
 
     async def record_message_activity(self, discord_id: int) -> None:
         if self.pool is not None:
             await self.pool.execute("UPDATE users SET last_message_at=NOW(),updated_at=NOW() WHERE discord_id=$1 AND is_active=TRUE", discord_id)
 
-    async def start_voice_session(self, discord_id: int, channel_id: int) -> int | None:
+    async def reconcile_voice_sessions(
+        self,
+        voice_channels_by_user: dict[int, int],
+        *,
+        observed_at: datetime,
+        recover: bool = False,
+    ) -> dict[int, int]:
+        """Align open sessions with channels containing two active profiles."""
         if self.pool is None:
-            return None
+            return {}
+        await self.ensure_instance_lock()
+
+        discord_ids = list(voice_channels_by_user)
+        channel_ids = [voice_channels_by_user[user_id] for user_id in discord_ids]
         async with self.pool.acquire() as connection:
             async with connection.transaction():
-                await connection.execute("SELECT pg_advisory_xact_lock($1)", discord_id)
-                session_id = await connection.fetchval(
-                    """SELECT id FROM voice_sessions
-                    WHERE discord_id=$1 AND ended_at IS NULL
-                    ORDER BY started_at DESC LIMIT 1""", discord_id,
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1)", VOICE_SESSION_LOCK_ID
                 )
-                if session_id is not None:
-                    return session_id
-                return await connection.fetchval(
-                    """INSERT INTO voice_sessions(discord_id,channel_id)
-                    SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM users
-                    WHERE discord_id=$1 AND is_active=TRUE) RETURNING id""",
-                    discord_id, channel_id,
+                if recover:
+                    await connection.execute(
+                        """UPDATE voice_sessions SET
+                        ended_at=GREATEST(started_at,LEAST(
+                            last_observed_at+INTERVAL '3 minutes',
+                            $1::TIMESTAMPTZ,NOW()
+                        )),
+                        duration_seconds=GREATEST(0,EXTRACT(EPOCH FROM(
+                            GREATEST(started_at,LEAST(
+                                last_observed_at+INTERVAL '3 minutes',
+                                $1::TIMESTAMPTZ,NOW()
+                            ))-started_at
+                        ))::INTEGER)
+                        WHERE ended_at IS NULL""",
+                        observed_at,
+                    )
+                else:
+                    await connection.execute(
+                        """WITH current_voice AS (
+                            SELECT * FROM UNNEST(
+                                $1::BIGINT[],$2::BIGINT[]
+                            ) AS voice(discord_id,channel_id)
+                        ), active_voice AS (
+                            SELECT current_voice.*,
+                                COUNT(*) OVER (
+                                    PARTITION BY current_voice.channel_id
+                                ) AS active_count
+                            FROM current_voice JOIN users
+                                ON users.discord_id=current_voice.discord_id
+                               AND users.is_active=TRUE
+                        ), qualified_voice AS (
+                            SELECT discord_id,channel_id FROM active_voice
+                            WHERE active_count>=2
+                        )
+                        UPDATE voice_sessions AS session SET
+                        ended_at=GREATEST(session.started_at,LEAST(
+                            session.last_observed_at+INTERVAL '3 minutes',
+                            $3::TIMESTAMPTZ,NOW()
+                        )),
+                        duration_seconds=GREATEST(0,EXTRACT(EPOCH FROM(
+                            GREATEST(session.started_at,LEAST(
+                                session.last_observed_at+INTERVAL '3 minutes',
+                                $3::TIMESTAMPTZ,NOW()
+                            ))-session.started_at
+                        ))::INTEGER)
+                        WHERE session.ended_at IS NULL AND (
+                            session.last_observed_at+INTERVAL '3 minutes'
+                                <LEAST($3::TIMESTAMPTZ,NOW())
+                            OR NOT EXISTS(
+                                SELECT 1 FROM qualified_voice
+                                WHERE qualified_voice.discord_id=session.discord_id
+                                  AND qualified_voice.channel_id=session.channel_id
+                            )
+                        )""",
+                        discord_ids,
+                        channel_ids,
+                        observed_at,
+                    )
+
+                await connection.execute(
+                    """WITH current_voice AS (
+                        SELECT * FROM UNNEST(
+                            $1::BIGINT[],$2::BIGINT[]
+                        ) AS voice(discord_id,channel_id)
+                    ), active_voice AS (
+                        SELECT current_voice.*,
+                            COUNT(*) OVER (
+                                PARTITION BY current_voice.channel_id
+                            ) AS active_count
+                        FROM current_voice JOIN users
+                            ON users.discord_id=current_voice.discord_id
+                           AND users.is_active=TRUE
+                    ), qualified_voice AS (
+                        SELECT discord_id,channel_id FROM active_voice
+                        WHERE active_count>=2
+                    )
+                    INSERT INTO voice_sessions(
+                        discord_id,channel_id,started_at,last_observed_at
+                    ) SELECT discord_id,channel_id,
+                        LEAST($3::TIMESTAMPTZ,NOW()),
+                        LEAST($3::TIMESTAMPTZ,NOW())
+                    FROM qualified_voice
+                    ON CONFLICT(discord_id) WHERE ended_at IS NULL DO UPDATE SET
+                        channel_id=EXCLUDED.channel_id,
+                        last_observed_at=GREATEST(
+                            voice_sessions.last_observed_at,
+                            EXCLUDED.last_observed_at
+                        )""",
+                    discord_ids,
+                    channel_ids,
+                    observed_at,
                 )
-    async def end_voice_session(self, session_id: int) -> None:
-        if self.pool is not None:
-            await self.pool.execute(
-                """UPDATE voice_sessions SET ended_at=NOW(),
-                duration_seconds=GREATEST(0,EXTRACT(EPOCH FROM(NOW()-started_at))::INTEGER)
-                WHERE id=$1 AND ended_at IS NULL""", session_id,
-            )
+                rows = await connection.fetch(
+                    """SELECT discord_id,id FROM voice_sessions
+                    WHERE ended_at IS NULL
+                      AND discord_id=ANY($1::BIGINT[])""",
+                    discord_ids,
+                )
+                return {row["discord_id"]: row["id"] for row in rows}
 
     async def get_weekly_voice_seconds(self, discord_id: int) -> int:
         if self.pool is None:
@@ -526,7 +864,10 @@ class Database:
                 return request
 
     async def get_inactive_users(
-        self, *, notification_only: bool = False
+        self,
+        *,
+        notification_only: bool = False,
+        discord_id: int | None = None,
     ) -> list[asyncpg.Record]:
         if self.pool is None:
             return []
@@ -538,6 +879,7 @@ class Database:
                 u.discord_id, NOW()-INTERVAL '7 days'
             )::INTEGER AS weekly_voice_seconds
             FROM users u WHERE COALESCE(u.guild_joined_at,u.created_at)<=NOW()-INTERVAL '7 days'
+            AND ($2::BIGINT IS NULL OR u.discord_id=$2)
             AND u.is_active=TRUE AND NOT EXISTS(SELECT 1 FROM leave_requests l
             WHERE l.discord_id=u.discord_id AND l.status='approved' AND l.ends_at>NOW())
             AND (u.activity_check_after IS NULL OR u.activity_check_after<=NOW())
@@ -548,6 +890,7 @@ class Database:
                     u.discord_id, NOW()-INTERVAL '7 days'
                 )<3600)""",
             notification_only,
+            discord_id,
         )
 
     async def get_activity_remove_roles(self, guild_id: int) -> bool:
@@ -827,7 +1170,9 @@ class Database:
             f"daily_warning_started_at:{guild_id}",
         )
 
-    async def get_daily_warning_users(self) -> list[asyncpg.Record]:
+    async def get_daily_warning_users(
+        self, *, discord_id: int | None = None
+    ) -> list[asyncpg.Record]:
         if self.pool is None:
             return []
         return await self.pool.fetch(
@@ -835,6 +1180,7 @@ class Database:
                 u.discord_id, NOW()-INTERVAL '24 hours'
             )::INTEGER AS daily_voice_seconds
             FROM users u WHERE u.is_active=TRUE
+            AND ($1::BIGINT IS NULL OR u.discord_id=$1)
             AND NOT EXISTS(SELECT 1 FROM leave_requests l WHERE l.discord_id=u.discord_id
                 AND l.status='approved' AND l.ends_at>NOW())
             AND COALESCE(u.guild_joined_at,u.created_at)<=NOW()-INTERVAL '24 hours'
@@ -843,7 +1189,8 @@ class Database:
             AND (COALESCE(u.last_message_at,u.guild_joined_at,u.created_at)
                 <NOW()-INTERVAL '24 hours' OR voice_seconds_since(
                     u.discord_id, NOW()-INTERVAL '24 hours'
-                )<1800)"""
+                )<1800)""",
+            discord_id,
         )
 
     async def record_activity_warning(
@@ -970,6 +1317,18 @@ class Database:
             application_id, status, reviewer_id,
         )
 
+    async def decline_open_applications_for_departed_member(
+        self, discord_id: int, guild_id: int, reviewer_id: int
+    ) -> list[asyncpg.Record]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetch(
+            """UPDATE applications SET status='declined',reviewer_id=$3,updated_at=NOW()
+            WHERE discord_id=$1 AND guild_id=$2
+            AND status IN('pending','review','interview') RETURNING *""",
+            discord_id, guild_id, reviewer_id,
+        )
+
     async def get_application(self, application_id: int) -> asyncpg.Record | None:
         if self.pool is None:
             return None
@@ -1022,6 +1381,17 @@ class Database:
             return None
         return await self.pool.fetchrow(
             "SELECT * FROM family_blacklist WHERE id=$1", entry_id
+        )
+
+    async def get_active_blacklist_entry_by_message(
+        self, message_id: int
+    ) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            """SELECT * FROM family_blacklist
+            WHERE channel_message_id=$1 AND active=TRUE""",
+            message_id,
         )
 
     async def find_blacklist_entries(
