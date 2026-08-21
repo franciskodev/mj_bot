@@ -763,6 +763,36 @@ class SystemsCog(commands.Cog):
         )
 
     @commands.slash_command(
+        name="dm_notifications",
+        description="Настроить регулярные уведомления о теге и активности",
+        guild_ids=GUILD_IDS,
+    )
+    async def dm_notifications(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        enabled: bool = commands.Param(
+            name="включены",
+            description="Отправлять регулярные уведомления людям в ЛС",
+        ),
+    ) -> None:
+        await self.bot.database.set_dm_notifications_enabled(enabled, inter.author.id)
+        status = "включены" if enabled else "отключены"
+        await inter.response.send_message(
+            f"{'🔔' if enabled else '🔕'} Регулярные уведомления о теге и "
+            f"активности в ЛС **{status}**.",
+            ephemeral=True,
+        )
+        await send_admin_log(
+            self.bot,
+            title="🔔 Настройка регулярных уведомлений",
+            description=(
+                f"Разработчик: {inter.author.mention}\n"
+                f"Уведомления о теге и активности в ЛС: **{status}**"
+            ),
+            color=disnake.Color.green() if enabled else disnake.Color.orange(),
+        )
+
+    @commands.slash_command(
         name="department", description="Управление отделами семьи", guild_ids=GUILD_IDS
     )
     async def department(self, inter: disnake.ApplicationCommandInteraction) -> None:

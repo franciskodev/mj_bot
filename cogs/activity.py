@@ -17,6 +17,7 @@ from config import (
 )
 from database import BotInstanceLockLost, INSTANCE_LOCK_HEARTBEAT_SECONDS
 from log_utils import send_admin_log
+from dm_notifications import send_dm_notification
 
 if TYPE_CHECKING:
     from bot import IntoleranceBot
@@ -1024,12 +1025,13 @@ class ActivityCog(commands.Cog):
             )
             embed.set_footer(text="INTERPOLOV & INTOLERANCE • Контроль активности")
 
-            delivered = True
-            try:
-                await member.send(embed=embed)
-            except disnake.DiscordException:
-                delivered = False
-                logging.warning("Could not send daily activity warning to %s", member.id)
+            delivery = await send_dm_notification(
+                self.bot,
+                member,
+                context="напоминание об активности",
+                embed=embed,
+            )
+            delivered = delivery.delivered
             await self.bot.database.record_activity_warning(member.id, reason, delivered)
 
     @check_daily_warnings.before_loop

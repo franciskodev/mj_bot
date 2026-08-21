@@ -1,18 +1,22 @@
 import logging
 import re
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import disnake
 from disnake.ext import commands
 
-from config import FORWARD_CHANNEL_ID
+from config import FORWARD_CHANNEL_ID, GUILD_ID
 
 if TYPE_CHECKING:
     from bot import IntoleranceBot
 
 
-DM_REPLY_TEXT = "иди нахуй"
+DM_TIMEOUT_DURATION = timedelta(minutes=10)
+DM_TIMEOUT_REASON = "Запрещённое слово в личном сообщении боту"
+DM_TIMEOUT_SUCCESS_REPLY = "иди нахуй, ты теперь в муте лох"
+DM_TIMEOUT_FAILURE_REPLY = "иди нахуй, жаль я тебе мут не могу дать, так бы трахнул"
 DM_TRIGGER_WORDS_PATH = Path(__file__).resolve().parent.parent / "dm_trigger_words.txt"
 
 
@@ -44,12 +48,43 @@ class DirectMessagesCog(commands.Cog):
             return
 
         if contains_dm_trigger_word(message.content):
+            timeout_applied = await self.timeout_main_guild_member(message.author.id)
+            reply_text = (
+                DM_TIMEOUT_SUCCESS_REPLY
+                if timeout_applied
+                else DM_TIMEOUT_FAILURE_REPLY
+            )
             try:
-                await message.channel.send(DM_REPLY_TEXT)
+                await message.channel.send(reply_text)
             except disnake.DiscordException:
                 logging.exception("Could not send automatic DM reply to %s", message.author.id)
 
         await self.forward_dm(message)
+
+    async def timeout_main_guild_member(self, user_id: int) -> bool:
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None:
+            logging.error("Could not apply DM timeout because guild %s is unavailable", GUILD_ID)
+            return False
+
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except disnake.DiscordException:
+                logging.info("DM author %s is not available in guild %s", user_id, GUILD_ID)
+                return False
+
+        try:
+            await member.timeout(
+                duration=DM_TIMEOUT_DURATION,
+                reason=DM_TIMEOUT_REASON,
+            )
+        except disnake.DiscordException:
+            logging.exception("Could not apply DM timeout to member %s", user_id)
+            return False
+
+        return True
 
     async def get_forward_channel(self) -> disnake.abc.Messageable | None:
         channel = self.bot.get_channel(FORWARD_CHANNEL_ID)

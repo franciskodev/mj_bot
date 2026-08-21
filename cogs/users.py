@@ -144,11 +144,14 @@ class ServerSelect(disnake.ui.StringSelect):
             disnake.SelectOption(
                 label="Orlando", value="Orlando", emoji="🌴", default="Orlando" in selected
             ),
+            disnake.SelectOption(
+                label="Denver", value="Denver", emoji="🏔️", default="Denver" in selected
+            ),
         ]
         super().__init__(
             placeholder="Выберите игровой сервер",
             min_values=1,
-            max_values=2,
+            max_values=3,
             options=options,
             custom_id=f"myinfo:servers:{owner.id}",
         )
@@ -278,7 +281,8 @@ class UsersCog(commands.Cog):
                     "1. Откройте наш Discord-сервер.\n"
                     "2. Введите команду `/myinfo`.\n"
                     "3. Нажмите на список **«Выберите игровой сервер»**.\n"
-                    "4. Выберите **Seattle**, **Orlando** или оба сервера.\n"
+                    "4. Выберите **Seattle**, **Orlando**, **Denver** "
+                    "или несколько серверов.\n"
                     "5. Нажмите **«Отправить»** для сохранения.\n\n"
                     "После сохранения бот автоматически выдаст нужную роль."
                 ),

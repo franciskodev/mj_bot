@@ -47,6 +47,7 @@ DEFAULT_COMMAND_LEVELS = {
     "access role_remove": 5,
     "access show": 5,
     "broadcast": 5,
+    "dm_notifications": 6,
 }
 
 # Эти команды нельзя ослабить пользовательской настройкой.
@@ -58,6 +59,7 @@ PROTECTED_COMMAND_LEVELS = {
     "access role_remove": 5,
     "access show": 5,
     "broadcast": 5,
+    "dm_notifications": 6,
 }
 
 
@@ -110,8 +112,6 @@ async def member_access_level(
     if member.guild.id == GUILD_ID:
         application_config = await bot.database.get_application_config(member.guild.id)
         if application_config is not None:
-            if role_ids.intersection(application_config["reviewer_role_ids"]):
-                level = max(level, 2)
             family_roles = {
                 application_config["interpolov_role_id"],
                 application_config["intolerance_role_id"],

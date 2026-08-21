@@ -340,6 +340,14 @@ class Database:
                     key TEXT PRIMARY KEY,
                     value TIMESTAMPTZ NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS dm_notification_settings (
+                    id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id=1),
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_by BIGINT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                INSERT INTO dm_notification_settings(id, enabled)
+                VALUES(1, TRUE) ON CONFLICT(id) DO NOTHING;
                 CREATE TABLE IF NOT EXISTS activity_check_config (
                     guild_id BIGINT PRIMARY KEY,
                     remove_roles BOOLEAN NOT NULL DEFAULT TRUE,
@@ -1218,7 +1226,6 @@ class Database:
         guild_id: int,
         panel_channel_id: int,
         category_id: int,
-        reviewer_role_ids: list[int],
         interpolov_role_id: int,
         intolerance_role_id: int,
     ) -> None:
@@ -1228,16 +1235,14 @@ class Database:
             """INSERT INTO application_guild_config(
                 guild_id,panel_channel_id,category_id,reviewer_role_id,reviewer_role_ids,
                 accepted_role_id,interpolov_role_id,intolerance_role_id
-            ) VALUES($1,$2,$3,($4::BIGINT[])[1],$4,$6,$5,$6) ON CONFLICT(guild_id) DO UPDATE SET
+            ) VALUES($1,$2,$3,$4,ARRAY[]::BIGINT[],$5,$4,$5) ON CONFLICT(guild_id) DO UPDATE SET
                 panel_channel_id=EXCLUDED.panel_channel_id,
                 category_id=EXCLUDED.category_id,
-                reviewer_role_id=EXCLUDED.reviewer_role_id,
-                reviewer_role_ids=EXCLUDED.reviewer_role_ids,
                 accepted_role_id=EXCLUDED.accepted_role_id,
                 interpolov_role_id=EXCLUDED.interpolov_role_id,
                 intolerance_role_id=EXCLUDED.intolerance_role_id,
                 updated_at=NOW()""",
-            guild_id, panel_channel_id, category_id, reviewer_role_ids,
+            guild_id, panel_channel_id, category_id,
             interpolov_role_id, intolerance_role_id,
         )
 
@@ -1426,6 +1431,27 @@ class Database:
             """SELECT access_level FROM command_access_levels
             WHERE guild_id=$1 AND command_name=$2""",
             guild_id, command_name,
+        )
+
+    async def get_dm_notifications_enabled(self) -> bool:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        enabled = await self.pool.fetchval(
+            "SELECT enabled FROM dm_notification_settings WHERE id=1"
+        )
+        return enabled is not False
+
+    async def set_dm_notifications_enabled(
+        self, enabled: bool, updated_by: int
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO dm_notification_settings(id,enabled,updated_by)
+            VALUES(1,$1,$2) ON CONFLICT(id) DO UPDATE SET
+                enabled=EXCLUDED.enabled,updated_by=EXCLUDED.updated_by,
+                updated_at=NOW()""",
+            enabled, updated_by,
         )
 
     async def set_command_access_level(

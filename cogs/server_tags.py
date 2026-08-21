@@ -7,6 +7,7 @@ from disnake.ext import commands, tasks
 
 from config import GUILD_ID, SERVER_TAG_LOG_CHANNEL_ID, TARGET_ROLE_IDS
 from log_utils import send_admin_log
+from dm_notifications import send_dm_notification
 
 if TYPE_CHECKING:
     from bot import IntoleranceBot
@@ -77,6 +78,7 @@ class ServerTagsCog(commands.Cog):
         primary_guild: dict[str, Any] | None,
         *,
         delivered: bool,
+        delivery_reason: str,
         family_role_ids: set[int],
     ) -> None:
         identity_guild_id = primary_guild.get("identity_guild_id") if primary_guild else None
@@ -132,7 +134,7 @@ class ServerTagsCog(commands.Cog):
         )
         embed.add_field(
             name="Доставка в ЛС",
-            value="Успешно" if delivered else "Не удалось доставить",
+            value=delivery_reason.capitalize(),
             inline=False,
         )
         embed.set_footer(text="INTERPOLOV & INTOLERANCE • Журнал серверных тегов")
@@ -191,19 +193,22 @@ class ServerTagsCog(commands.Cog):
                 embed.set_footer(
                     text="INTERPOLOV & INTOLERANCE • Напоминание о теге"
                 )
-                delivered = True
-                try:
-                    await member.send(embed=embed)
-                except disnake.DiscordException:
-                    delivered = False
+                delivery = await send_dm_notification(
+                    self.bot,
+                    member,
+                    context="напоминание о серверном теге",
+                    embed=embed,
+                )
+                delivered = delivery.delivered
+                if not delivered:
                     failed += 1
-                    logging.warning("Could not send server tag reminder to %s", user_id)
                 reminded += 1
 
                 await self.log_tag_notification(
                     member,
                     primary_guild,
                     delivered=delivered,
+                    delivery_reason=delivery.reason,
                     family_role_ids=role_ids,
                 )
 

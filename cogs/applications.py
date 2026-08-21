@@ -31,6 +31,7 @@ FAMILY_NAMES = {
 GAME_SERVERS = {
     "seattle": "Seattle",
     "orlando": "Orlando",
+    "denver": "Denver",
 }
 def server_select(family_key: str) -> disnake.ui.StringSelect:
     return disnake.ui.StringSelect(
@@ -140,12 +141,12 @@ class ApplicationModal(disnake.ui.Modal):
         if guild is None:
             return
         category = guild.get_channel(self.config["category_id"])
-        reviewer_roles = [
-            role for role_id in self.config["reviewer_role_ids"]
-            if (role := guild.get_role(role_id)) is not None
-        ]
-        if not isinstance(category, disnake.CategoryChannel) or not reviewer_roles or guild.me is None:
-            await inter.edit_original_response("Настройки тикетов устарели. Сообщите администратору.")
+        staff_roles = await self.cog.application_staff_roles(guild)
+        if not isinstance(category, disnake.CategoryChannel) or not staff_roles or guild.me is None:
+            await inter.edit_original_response(
+                "Настройки тикетов устарели или для уровней доступа 2–4 не назначены "
+                "роли. Сообщите администратору."
+            )
             return
 
         safe_name = re.sub(r"[^a-z0-9-]", "", inter.author.name.lower().replace("_", "-"))[:40] or str(inter.author.id)
@@ -154,8 +155,8 @@ class ApplicationModal(disnake.ui.Modal):
             inter.author: disnake.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             guild.me: disnake.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
         }
-        for reviewer_role in reviewer_roles:
-            overwrites[reviewer_role] = disnake.PermissionOverwrite(
+        for staff_role in staff_roles:
+            overwrites[staff_role] = disnake.PermissionOverwrite(
                 view_channel=True, send_messages=True, read_message_history=True
             )
         try:
@@ -210,7 +211,7 @@ class ApplicationModal(disnake.ui.Modal):
             logging.exception("Could not save application JSON")
         embed = application_embed(application, inter.author, previous)
         message = await ticket.send(
-            content=f"{' '.join(role.mention for role in reviewer_roles)} {inter.author.mention}",
+            content=f"{' '.join(role.mention for role in staff_roles)} {inter.author.mention}",
             embed=embed,
             components=application_buttons(application["id"]),
         )
@@ -241,6 +242,23 @@ class ApplicationModal(disnake.ui.Modal):
 class ApplicationsCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
+
+    async def application_staff_roles(
+        self, guild: disnake.Guild
+    ) -> list[disnake.Role]:
+        role_ids = [
+            row["role_id"]
+            for row in await self.bot.database.get_access_roles(guild.id)
+            if 2 <= row["access_level"] <= 4
+        ]
+        for department in await self.bot.database.get_department_configs(guild.id):
+            role_ids.append(department["head_role_id"])
+            if department["department"] == "recruiters":
+                role_ids.append(department["member_role_id"])
+        return [
+            role for role_id in dict.fromkeys(role_ids)
+            if (role := guild.get_role(role_id)) is not None
+        ]
 
     async def _decline_departed_member_application(
         self, member: disnake.Member, application: asyncpg.Record
@@ -416,27 +434,17 @@ class ApplicationsCog(commands.Cog):
         inter: disnake.ApplicationCommandInteraction,
         panel_channel: disnake.TextChannel = commands.Param(description="Канал с кнопкой подачи заявки"),
         ticket_category: disnake.CategoryChannel = commands.Param(description="Категория приватных тикетов"),
-        reviewer_role_1: disnake.Role = commands.Param(description="Первая роль рекрутёров"),
         interpolov_role: disnake.Role = commands.Param(description="Роль участника INTERPOLOV"),
         intolerance_role: disnake.Role = commands.Param(description="Роль участника INTOLERANCE"),
-        reviewer_role_2: disnake.Role | None = commands.Param(default=None, description="Вторая роль рекрутёров"),
-        reviewer_role_3: disnake.Role | None = commands.Param(default=None, description="Третья роль рекрутёров"),
-        reviewer_role_4: disnake.Role | None = commands.Param(default=None, description="Четвёртая роль рекрутёров"),
-        reviewer_role_5: disnake.Role | None = commands.Param(default=None, description="Пятая роль рекрутёров"),
     ) -> None:
         if inter.guild_id is None:
             return
         await inter.response.defer(ephemeral=True)
-        reviewer_roles = list(dict.fromkeys(filter(None, (
-            reviewer_role_1, reviewer_role_2, reviewer_role_3,
-            reviewer_role_4, reviewer_role_5,
-        ))))
         try:
             await self.bot.database.save_application_config(
                 inter.guild_id,
                 panel_channel.id,
                 ticket_category.id,
-                [role.id for role in reviewer_roles],
                 interpolov_role.id,
                 intolerance_role.id,
             )
@@ -487,7 +495,7 @@ class ApplicationsCog(commands.Cog):
                 f"Администратор: {inter.author.mention}\n"
                 f"Канал: {panel_channel.mention}\n"
                 f"Категория: **{ticket_category.name}**\n"
-                f"Рекрутёры: {' '.join(role.mention for role in reviewer_roles)}\n"
+                "Доступ к тикетам: **уровни 2–4**\n"
                 f"INTERPOLOV: {interpolov_role.mention}\n"
                 f"INTOLERANCE: {intolerance_role.mention}"
             ),
