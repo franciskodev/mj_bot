@@ -214,12 +214,11 @@ class MeetingsCog(commands.Cog):
         ),
     ) -> None:
         await inter.response.defer(ephemeral=True)
-        config = await self.bot.database.get_application_config(inter.guild_id)
         family_role_ids = set(TARGET_ROLE_IDS)
-        if config is not None:
-            family_role_ids.update(
-                {config["interpolov_role_id"], config["intolerance_role_id"]}
-            )
+        family_role_ids.update(
+            row["role_id"] for row in await self.bot.database.get_families(inter.guild_id)
+            if row["role_id"] is not None
+        )
         present_ids = [member.id for member in channel.members if not member.bot]
         family_ids = [
             member.id

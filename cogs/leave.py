@@ -138,11 +138,10 @@ class LeaveCog(commands.Cog):
         inter: disnake.ApplicationCommandInteraction | disnake.ModalInteraction,
     ) -> str | None:
         family_role_ids = set(TARGET_ROLE_IDS)
-        config = await self.bot.database.get_application_config(inter.guild_id)
-        if config is not None:
-            family_role_ids.update(
-                {config["interpolov_role_id"], config["intolerance_role_id"]}
-            )
+        family_role_ids.update(
+            row["role_id"] for row in await self.bot.database.get_families(inter.guild_id)
+            if row["role_id"] is not None
+        )
         if not isinstance(inter.author, disnake.Member) or not any(
             role.id in family_role_ids for role in inter.author.roles
         ):

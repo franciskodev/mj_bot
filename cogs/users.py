@@ -7,7 +7,7 @@ import asyncpg
 import disnake
 from disnake.ext import commands, tasks
 
-from config import GUILD_ID, GUILD_IDS, SERVER_ROLE_IDS, TARGET_ROLE_IDS
+from config import FAMILY_NAME, GUILD_ID, GUILD_IDS, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -21,30 +21,34 @@ STATUS_COLORS = {
 }
 
 
-def selected_servers(server_name: str | None) -> set[str]:
+def selected_servers(server_name: str | None, valid_names: set[str]) -> set[str]:
     return {
         server.strip()
         for server in (server_name or "").split(",")
-        if server.strip() in SERVER_ROLE_IDS
+        if server.strip() in valid_names
     }
 
 
-def servers_from_roles(member: disnake.Member) -> list[str]:
+def servers_from_roles(member: disnake.Member, server_rows) -> list[str]:
     member_role_ids = {role.id for role in member.roles}
     return [
-        server
-        for server, role_id in SERVER_ROLE_IDS.items()
-        if role_id in member_role_ids
+        row["name"]
+        for row in server_rows
+        if row["role_id"] is not None and row["role_id"] in member_role_ids
     ]
 
 
 async def sync_server_roles(
-    member: disnake.Member, servers: set[str], *, reason: str
+    member: disnake.Member, servers: set[str], server_rows, *, reason: str
 ) -> bool:
-    selected_role_ids = {SERVER_ROLE_IDS[server] for server in servers}
+    selected_role_ids = {
+        row["role_id"] for row in server_rows
+        if row["name"] in servers and row["role_id"] is not None
+    }
     server_roles = {
         role_id: member.guild.get_role(role_id)
-        for role_id in SERVER_ROLE_IDS.values()
+        for row in server_rows
+        if (role_id := row["role_id"]) is not None
     }
     if any(role is None for role in server_roles.values()):
         return False
@@ -128,6 +132,7 @@ class ServerSelect(disnake.ui.StringSelect):
         bot: "IntoleranceBot",
         owner: disnake.Member,
         current_servers: str | None,
+        server_rows,
     ) -> None:
         self.bot = bot
         self.profile_owner = owner
@@ -137,21 +142,17 @@ class ServerSelect(disnake.ui.StringSelect):
             for server in (current_servers or "").split(",")
             if server.strip()
         }
+        self.server_rows = server_rows
         options = [
             disnake.SelectOption(
-                label="Seattle", value="Seattle", emoji="🌲", default="Seattle" in selected
-            ),
-            disnake.SelectOption(
-                label="Orlando", value="Orlando", emoji="🌴", default="Orlando" in selected
-            ),
-            disnake.SelectOption(
-                label="Denver", value="Denver", emoji="🏔️", default="Denver" in selected
-            ),
+                label=row["name"], value=row["name"], default=row["name"] in selected
+            )
+            for row in server_rows[:25]
         ]
         super().__init__(
             placeholder="Выберите игровой сервер",
             min_values=1,
-            max_values=3,
+            max_values=len(options),
             options=options,
             custom_id=f"myinfo:servers:{owner.id}",
         )
@@ -170,6 +171,7 @@ class ServerSelect(disnake.ui.StringSelect):
         role_sync_succeeded = await sync_server_roles(
             self.profile_owner,
             set(self.values),
+            self.server_rows,
             reason="Выбор сервера в /myinfo",
         )
         weekly_voice_seconds, total_voice_seconds, warning_count = await asyncio.gather(
@@ -202,9 +204,10 @@ class UserServerView(disnake.ui.View):
         bot: "IntoleranceBot",
         owner: disnake.Member,
         current_servers: str | None,
+        server_rows,
     ) -> None:
         super().__init__(timeout=300)
-        self.add_item(ServerSelect(bot, owner, current_servers))
+        self.add_item(ServerSelect(bot, owner, current_servers, server_rows))
 
 
 
@@ -225,7 +228,8 @@ class UsersCog(commands.Cog):
         if after.guild.id != GUILD_ID or after.bot:
             return
 
-        server_role_ids = set(SERVER_ROLE_IDS.values())
+        server_rows = await self.bot.database.get_game_servers(after.guild.id)
+        server_role_ids = {row["role_id"] for row in server_rows if row["role_id"] is not None}
         before_server_roles = {role.id for role in before.roles} & server_role_ids
         after_server_roles = {role.id for role in after.roles} & server_role_ids
         if before_server_roles == after_server_roles:
@@ -233,7 +237,7 @@ class UsersCog(commands.Cog):
         if await self.bot.database.get_user(after.id) is None:
             return
 
-        servers = servers_from_roles(after)
+        servers = servers_from_roles(after, server_rows)
         await self.bot.database.update_user_profile(
             after.id,
             server_name=", ".join(servers) if servers else "-",
@@ -246,6 +250,8 @@ class UsersCog(commands.Cog):
             return
 
         profiles = await self.bot.database.get_active_users()
+        server_rows = await self.bot.database.get_game_servers(guild.id)
+        valid_server_names = {row["name"] for row in server_rows}
         for profile in profiles:
             member = guild.get_member(profile["discord_id"])
             if (
@@ -255,9 +261,9 @@ class UsersCog(commands.Cog):
             ):
                 continue
 
-            servers = servers_from_roles(member)
+            servers = servers_from_roles(member, server_rows)
             server_name = ", ".join(servers)
-            if selected_servers(profile["server_name"]) != set(servers):
+            if selected_servers(profile["server_name"], valid_server_names) != set(servers):
                 await self.bot.database.update_user_profile(
                     member.id,
                     server_name=server_name if servers else "-",
@@ -281,8 +287,7 @@ class UsersCog(commands.Cog):
                     "1. Откройте наш Discord-сервер.\n"
                     "2. Введите команду `/myinfo`.\n"
                     "3. Нажмите на список **«Выберите игровой сервер»**.\n"
-                    "4. Выберите **Seattle**, **Orlando**, **Denver** "
-                    "или несколько серверов.\n"
+                    "4. Выберите нужный игровой сервер или несколько серверов.\n"
                     "5. Нажмите **«Отправить»** для сохранения.\n\n"
                     "После сохранения бот автоматически выдаст нужную роль."
                 ),
@@ -340,6 +345,15 @@ class UsersCog(commands.Cog):
             self.bot.database.get_total_voice_seconds(inter.author.id),
             self.bot.database.get_active_disciplinary_warning_count(inter.author.id),
         )
+        server_rows = [
+            row for row in await self.bot.database.get_game_servers(inter.guild_id)
+            if row["role_id"] is not None and inter.guild.get_role(row["role_id"]) is not None
+        ][:25]
+        if not server_rows:
+            await inter.response.send_message(
+                "Игровые серверы ещё не настроены. Сообщите администратору.", ephemeral=True
+            )
+            return
         await inter.response.send_message(
             embed=profile_embed(
                 inter.author,
@@ -348,7 +362,7 @@ class UsersCog(commands.Cog):
                 total_voice_seconds,
                 warning_count,
             ),
-            view=UserServerView(self.bot, inter.author, profile["server_name"]),
+            view=UserServerView(self.bot, inter.author, profile["server_name"], server_rows),
             ephemeral=True,
         )
 
@@ -365,10 +379,6 @@ class UsersCog(commands.Cog):
         self,
         inter: disnake.ApplicationCommandInteraction,
         member: disnake.Member = commands.Param(description="Участник Discord"),
-        family: str = commands.Param(
-            description="Семья участника",
-            choices=["INTERPOLOV", "INTOLERANCE"],
-        ),
         nickname: str = commands.Param(description="Игровой ник", max_length=100),
         server: str | None = commands.Param(default=None, description="Игровой сервер", max_length=100),
         bio: str | None = commands.Param(default=None, description="Описание профиля", max_length=500),
@@ -380,15 +390,25 @@ class UsersCog(commands.Cog):
                 ephemeral=True,
             )
             return
-        role_id = config[
-            "interpolov_role_id" if family == "INTERPOLOV" else "intolerance_role_id"
-        ]
-        family_role_ids = {config["interpolov_role_id"], config["intolerance_role_id"]}
+        family_row = await self.bot.database.get_family_by_name(
+            inter.guild_id, FAMILY_NAME
+        )
+        if family_row is None or family_row["role_id"] is None:
+            await inter.response.send_message(
+                "Роль объединённой семьи не настроена. Используйте `/applications setup`.",
+                ephemeral=True,
+            )
+            return
+        role_id = family_row["role_id"]
+        family_role_ids = {
+            row["role_id"] for row in await self.bot.database.get_families(inter.guild_id)
+            if row["role_id"] is not None
+        }
         if not member.guild_permissions.administrator and not any(
             role.id == role_id for role in member.roles
         ):
             await inter.response.send_message(
-                f"У пользователя нет роли семьи **{family}**.",
+                f"У пользователя нет роли семьи **{FAMILY_NAME}**.",
                 ephemeral=True,
             )
             return
@@ -401,7 +421,7 @@ class UsersCog(commands.Cog):
             added_by=inter.author.id,
             reactivate=True,
         )
-        profile = await self.bot.database.set_user_family(member.id, family)
+        profile = await self.bot.database.set_user_family(member.id, FAMILY_NAME)
         self.bot.dispatch("voice_eligibility_changed")
         await inter.response.send_message(
             content=f"✅ Профиль {member.mention} добавлен или обновлён.",
@@ -450,14 +470,10 @@ class UsersCog(commands.Cog):
             reactivate = status == "Активен" and not profile["is_active"]
             if reactivate and not member.guild_permissions.administrator:
                 family_role_ids = set(TARGET_ROLE_IDS)
-                config = await self.bot.database.get_application_config(GUILD_ID)
-                if config is not None:
-                    family_role_ids.update(
-                        {
-                            config["interpolov_role_id"],
-                            config["intolerance_role_id"],
-                        }
-                    )
+                family_role_ids.update(
+                    row["role_id"] for row in await self.bot.database.get_families(GUILD_ID)
+                    if row["role_id"] is not None
+                )
                 if not any(role.id in family_role_ids for role in member.roles):
                     await inter.response.send_message(
                         "Нельзя реактивировать профиль без семейной роли. "

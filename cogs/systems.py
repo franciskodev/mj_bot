@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterable
 
 import disnake
+import asyncpg
 from disnake.ext import commands
 
 from access_control import (
@@ -14,7 +15,7 @@ from access_control import (
     command_access_level,
     member_access_level,
 )
-from config import BLACKLIST_CHANNEL_ID, GUILD_IDS
+from config import BLACKLIST_CHANNEL_ID, FAMILY_NAME, GUILD_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -182,6 +183,96 @@ class HelpPaginator(disnake.ui.View):
 class SystemsCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role: disnake.Role) -> None:
+        if role.guild.id not in GUILD_IDS:
+            return
+        await self.bot.database.remove_deleted_role_references(role.guild.id, role.id)
+        applications_cog = self.bot.get_cog("ApplicationsCog")
+        if applications_cog is not None:
+            await applications_cog.refresh_application_panel(role.guild.id)
+        logging.info("Removed configuration references to deleted role %s", role.id)
+
+    @commands.slash_command(
+        name="settings", description="Настройка серверов и семей", guild_ids=GUILD_IDS
+    )
+    async def settings(self, inter: disnake.ApplicationCommandInteraction) -> None:
+        pass
+
+    @settings.sub_command(name="server_add", description="Добавить сервер или изменить его роль")
+    async def settings_server_add(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        name: str = commands.Param(name="название", max_length=80),
+        role: disnake.Role = commands.Param(name="роль"),
+    ) -> None:
+        if inter.guild_id is None:
+            return
+        name = name.strip()
+        if not name or "," in name:
+            await inter.response.send_message(
+                "Название не может быть пустым или содержать запятую.", ephemeral=True
+            )
+            return
+        existing_servers = await self.bot.database.get_game_servers(inter.guild_id)
+        if len(existing_servers) >= 25 and all(
+            row["name"].casefold() != name.casefold() for row in existing_servers
+        ):
+            await inter.response.send_message(
+                "Discord позволяет показать максимум 25 серверов в одном списке.", ephemeral=True
+            )
+            return
+        try:
+            row = await self.bot.database.upsert_game_server(
+                inter.guild_id, name, role.id, inter.author.id
+            )
+        except asyncpg.UniqueViolationError:
+            await inter.response.send_message(
+                "Эта роль уже привязана к другому серверу.", ephemeral=True
+            )
+            return
+        await inter.response.send_message(
+            f"✅ Сервер **{row['name']}** привязан к роли {role.mention}.", ephemeral=True
+        )
+
+    @settings.sub_command(name="server_remove", description="Удалить игровой сервер")
+    async def settings_server_remove(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        name: str = commands.Param(name="название", max_length=80),
+    ) -> None:
+        if inter.guild_id is None:
+            return
+        row = await self.bot.database.delete_game_server(inter.guild_id, name.strip())
+        await inter.response.send_message(
+            f"✅ Сервер **{row['name']}** удалён."
+            if row else "Сервер с таким названием не найден.",
+            ephemeral=True,
+        )
+
+    @settings.sub_command(name="show", description="Показать серверы и семейную роль")
+    async def settings_show(self, inter: disnake.ApplicationCommandInteraction) -> None:
+        if inter.guild_id is None:
+            return
+        servers, families = await asyncio.gather(
+            self.bot.database.get_game_servers(inter.guild_id),
+            self.bot.database.get_families(inter.guild_id),
+        )
+        server_lines = [
+            f"• **{row['name']}** — " + (f"<@&{row['role_id']}>" if row['role_id'] else "роль не задана")
+            for row in servers
+        ]
+        family_lines = [
+            f"• **{row['name']}** — " + (f"<@&{row['role_id']}>" if row['role_id'] else "роль удалена")
+            for row in families
+        ]
+        await inter.response.send_message(
+            "**Игровые серверы**\n" + ("\n".join(server_lines) or "—")
+            + f"\n\n**Объединённая семья {FAMILY_NAME}**\n"
+            + ("\n".join(family_lines) or "—"),
+            ephemeral=True,
+        )
 
     async def get_blacklist_channel(self):
         channel = self.bot.get_channel(BLACKLIST_CHANNEL_ID)

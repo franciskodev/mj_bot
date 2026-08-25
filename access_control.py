@@ -46,6 +46,9 @@ DEFAULT_COMMAND_LEVELS = {
     "access role_add": 5,
     "access role_remove": 5,
     "access show": 5,
+    "settings server_add": 5,
+    "settings server_remove": 5,
+    "settings show": 5,
     "broadcast": 5,
     "dm_notifications": 6,
 }
@@ -58,6 +61,9 @@ PROTECTED_COMMAND_LEVELS = {
     "access role_add": 5,
     "access role_remove": 5,
     "access show": 5,
+    "settings server_add": 5,
+    "settings server_remove": 5,
+    "settings show": 5,
     "broadcast": 5,
     "dm_notifications": 6,
 }
@@ -110,14 +116,12 @@ async def member_access_level(
             level = max(level, 2)
 
     if member.guild.id == GUILD_ID:
-        application_config = await bot.database.get_application_config(member.guild.id)
-        if application_config is not None:
-            family_roles = {
-                application_config["interpolov_role_id"],
-                application_config["intolerance_role_id"],
-            }
-            if role_ids.intersection(family_roles):
-                level = max(level, 1)
+        family_roles = {
+            row["role_id"] for row in await bot.database.get_families(member.guild.id)
+            if row["role_id"] is not None
+        }
+        if role_ids.intersection(family_roles):
+            level = max(level, 1)
         if role_ids.intersection(TARGET_ROLE_IDS):
             level = max(level, 1)
 

@@ -11,7 +11,7 @@ from config import (
     ALLOWED_GUILD_IDS,
     DEFAULT_MEMBER_ROLE_ID,
     FAMILY_MEMBER_ROLE_ID,
-    FAMILY_ROLE_IDS_FOR_SYNC,
+    FAMILY_MEMBER_TRIGGER_ROLE_IDS,
     GUILD_ID,
     TARGET_ROLE_IDS,
 )
@@ -65,11 +65,19 @@ class ActivityCog(commands.Cog):
 
     async def get_family_role_ids(self) -> set[int]:
         role_ids = set(TARGET_ROLE_IDS)
-        config = await self.bot.database.get_application_config(GUILD_ID)
-        if config is not None:
-            role_ids.update(
-                {config["interpolov_role_id"], config["intolerance_role_id"]}
-            )
+        role_ids.update(
+            row["role_id"] for row in await self.bot.database.get_families(GUILD_ID)
+            if row["role_id"] is not None
+        )
+        return role_ids
+
+    async def get_family_member_trigger_role_ids(self) -> set[int]:
+        role_ids = set(FAMILY_MEMBER_TRIGGER_ROLE_IDS)
+        role_ids.update(
+            row["role_id"]
+            for row in await self.bot.database.get_game_servers(GUILD_ID)
+            if row["role_id"] is not None
+        )
         return role_ids
 
     @commands.slash_command(
@@ -93,17 +101,11 @@ class ActivityCog(commands.Cog):
         )
 
     async def sync_member_family(self, member: disnake.Member) -> None:
-        config = await self.bot.database.get_application_config(member.guild.id)
-        if config is None:
-            return
         member_role_ids = {role.id for role in member.roles}
         families = [
-            family_name
-            for family_name, role_id in (
-                ("INTERPOLOV", config["interpolov_role_id"]),
-                ("INTOLERANCE", config["intolerance_role_id"]),
-            )
-            if role_id in member_role_ids
+            row["name"]
+            for row in await self.bot.database.get_families(member.guild.id)
+            if row["role_id"] in member_role_ids
         ]
         if len(families) == 1:
             await self.bot.database.set_user_family(member.id, families[0])
@@ -113,9 +115,10 @@ class ActivityCog(commands.Cog):
             return
 
         member_role_ids = {role.id for role in member.roles}
+        trigger_role_ids = await self.get_family_member_trigger_role_ids()
         if (
             FAMILY_MEMBER_ROLE_ID in member_role_ids
-            or not member_role_ids.intersection(FAMILY_ROLE_IDS_FOR_SYNC)
+            or not member_role_ids.intersection(trigger_role_ids)
         ):
             return
 

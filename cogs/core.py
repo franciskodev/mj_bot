@@ -72,11 +72,10 @@ class CoreCog(commands.Cog):
         guild_role_ids: dict[int, set[int]] = {}
         for guild_id in ALLOWED_GUILD_IDS:
             role_ids = set(TARGET_ROLE_IDS) if guild_id == GUILD_ID else set()
-            config = await self.bot.database.get_application_config(guild_id)
-            if config is not None:
-                role_ids.update(
-                    {config["interpolov_role_id"], config["intolerance_role_id"]}
-                )
+            role_ids.update(
+                row["role_id"] for row in await self.bot.database.get_families(guild_id)
+                if row["role_id"] is not None
+            )
             guild_role_ids[guild_id] = role_ids
 
         for profile in await self.bot.database.get_active_users():

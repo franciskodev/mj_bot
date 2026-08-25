@@ -6,7 +6,14 @@ from time import monotonic
 import asyncpg
 import disnake
 
-from config import DATABASE_URL, GUILD_ID, TARGET_ROLE_IDS
+from config import (
+    DATABASE_URL,
+    FAMILY_MEMBER_ROLE_ID,
+    FAMILY_NAME,
+    GUILD_ID,
+    SERVER_ROLE_IDS,
+    TARGET_ROLE_IDS,
+)
 
 
 VOICE_SESSION_LOCK_ID = 0x564F494345
@@ -327,15 +334,17 @@ class Database:
                     category_id BIGINT NOT NULL,
                     reviewer_role_id BIGINT NOT NULL,
                     accepted_role_id BIGINT NOT NULL,
+                    family_role_id BIGINT NOT NULL,
                     panel_message_id BIGINT,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 ALTER TABLE application_guild_config
-                    ADD COLUMN IF NOT EXISTS interpolov_role_id BIGINT;
-                ALTER TABLE application_guild_config
-                    ADD COLUMN IF NOT EXISTS intolerance_role_id BIGINT;
+                    ADD COLUMN IF NOT EXISTS family_role_id BIGINT;
                 ALTER TABLE application_guild_config
                     ADD COLUMN IF NOT EXISTS reviewer_role_ids BIGINT[];
+                ALTER TABLE application_guild_config
+                    DROP COLUMN IF EXISTS interpolov_role_id,
+                    DROP COLUMN IF EXISTS intolerance_role_id;
                 CREATE TABLE IF NOT EXISTS bot_settings (
                     key TEXT PRIMARY KEY,
                     value TIMESTAMPTZ NOT NULL
@@ -390,6 +399,35 @@ class Database:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY(guild_id, access_level, role_id)
                 );
+                CREATE TABLE IF NOT EXISTS game_servers (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    role_id BIGINT,
+                    added_by BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(guild_id, name)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS game_servers_guild_role_idx
+                    ON game_servers(guild_id, role_id) WHERE role_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS game_servers_guild_name_ci_idx
+                    ON game_servers(guild_id, LOWER(name));
+                CREATE TABLE IF NOT EXISTS families (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    role_id BIGINT,
+                    added_by BIGINT NOT NULL,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(guild_id, name)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS families_guild_role_idx
+                    ON families(guild_id, role_id) WHERE role_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS families_guild_name_ci_idx
+                    ON families(guild_id, LOWER(name));
                 CREATE TABLE IF NOT EXISTS department_config (
                     guild_id BIGINT NOT NULL,
                     department TEXT NOT NULL CHECK(department IN ('recruiters','contractors')),
@@ -409,36 +447,86 @@ class Database:
                 "ALTER TABLE applications ALTER COLUMN guild_id SET NOT NULL"
             )
             await connection.execute(
-                """UPDATE applications SET family_name='INTOLERANCE'
-                WHERE family_name IS NULL"""
+                "UPDATE applications SET family_name=$1 WHERE family_name IS DISTINCT FROM $1",
+                FAMILY_NAME,
             )
             await connection.execute(
                 "ALTER TABLE applications ALTER COLUMN family_name SET NOT NULL"
             )
             await connection.execute(
+                """UPDATE users SET family_name=$1,updated_at=NOW()
+                WHERE family_name IS NOT NULL AND family_name IS DISTINCT FROM $1""",
+                FAMILY_NAME,
+            )
+            await connection.execute(
                 """INSERT INTO application_guild_config(
                     guild_id,panel_channel_id,category_id,reviewer_role_id,
                     accepted_role_id,panel_message_id,updated_at,
-                    interpolov_role_id,intolerance_role_id,reviewer_role_ids
+                    family_role_id,reviewer_role_ids
                 ) SELECT $1,panel_channel_id,category_id,
                     reviewer_role_id,accepted_role_id,panel_message_id,updated_at,
-                    accepted_role_id,accepted_role_id,ARRAY[reviewer_role_id]
+                    accepted_role_id,ARRAY[reviewer_role_id]
                 FROM application_config WHERE id=1
                 ON CONFLICT(guild_id) DO NOTHING""",
                 GUILD_ID,
             )
             await connection.execute(
                 """UPDATE application_guild_config SET
-                    interpolov_role_id=COALESCE(interpolov_role_id,accepted_role_id),
-                    intolerance_role_id=COALESCE(intolerance_role_id,accepted_role_id),
+                    family_role_id=COALESCE(family_role_id,accepted_role_id),
                     reviewer_role_ids=COALESCE(reviewer_role_ids,ARRAY[reviewer_role_id])"""
             )
             await connection.execute(
                 """ALTER TABLE application_guild_config
-                    ALTER COLUMN interpolov_role_id SET NOT NULL,
-                    ALTER COLUMN intolerance_role_id SET NOT NULL,
+                    ALTER COLUMN family_role_id SET NOT NULL,
                     ALTER COLUMN reviewer_role_ids SET NOT NULL"""
             )
+            has_configured_servers = await connection.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM game_servers WHERE guild_id=$1)", GUILD_ID
+            )
+            if not has_configured_servers:
+                for server_name, role_id in SERVER_ROLE_IDS.items():
+                    await connection.execute(
+                        """INSERT INTO game_servers(guild_id,name,role_id,added_by)
+                        VALUES($1,$2,$3,$4)""",
+                        GUILD_ID, server_name, role_id, 811292492481298432,
+                    )
+            await connection.execute(
+                """UPDATE application_guild_config SET
+                    accepted_role_id=$2,
+                    family_role_id=$2,
+                    updated_at=NOW()
+                WHERE guild_id=$1""",
+                GUILD_ID,
+                FAMILY_MEMBER_ROLE_ID,
+            )
+            await connection.execute(
+                """UPDATE families SET role_id=NULL,active=FALSE,updated_at=NOW()
+                WHERE guild_id=$1 AND LOWER(name)<>LOWER($2)""",
+                GUILD_ID,
+                FAMILY_NAME,
+            )
+            combined_family = await connection.fetchrow(
+                "SELECT id FROM families WHERE guild_id=$1 AND LOWER(name)=LOWER($2)",
+                GUILD_ID,
+                FAMILY_NAME,
+            )
+            if combined_family is None:
+                await connection.execute(
+                    """INSERT INTO families(guild_id,name,role_id,added_by)
+                    VALUES($1,$2,$3,$4)""",
+                    GUILD_ID,
+                    FAMILY_NAME,
+                    FAMILY_MEMBER_ROLE_ID,
+                    811292492481298432,
+                )
+            else:
+                await connection.execute(
+                    """UPDATE families SET name=$2,role_id=$3,active=TRUE,updated_at=NOW()
+                    WHERE id=$1""",
+                    combined_family["id"],
+                    FAMILY_NAME,
+                    FAMILY_MEMBER_ROLE_ID,
+                )
 
         logging.info("Connected to PostgreSQL")
 
@@ -588,7 +676,7 @@ class Database:
     ) -> asyncpg.Record | None:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
-        if family_name not in {"INTERPOLOV", "INTOLERANCE"}:
+        if family_name != FAMILY_NAME:
             raise ValueError("Unknown family name")
 
         return await self.pool.fetchrow(
@@ -1226,24 +1314,22 @@ class Database:
         guild_id: int,
         panel_channel_id: int,
         category_id: int,
-        interpolov_role_id: int,
-        intolerance_role_id: int,
+        family_role_id: int,
     ) -> None:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
         await self.pool.execute(
             """INSERT INTO application_guild_config(
                 guild_id,panel_channel_id,category_id,reviewer_role_id,reviewer_role_ids,
-                accepted_role_id,interpolov_role_id,intolerance_role_id
-            ) VALUES($1,$2,$3,$4,ARRAY[]::BIGINT[],$5,$4,$5) ON CONFLICT(guild_id) DO UPDATE SET
+                accepted_role_id,family_role_id
+            ) VALUES($1,$2,$3,$4,ARRAY[]::BIGINT[],$4,$4) ON CONFLICT(guild_id) DO UPDATE SET
                 panel_channel_id=EXCLUDED.panel_channel_id,
                 category_id=EXCLUDED.category_id,
                 accepted_role_id=EXCLUDED.accepted_role_id,
-                interpolov_role_id=EXCLUDED.interpolov_role_id,
-                intolerance_role_id=EXCLUDED.intolerance_role_id,
+                family_role_id=EXCLUDED.family_role_id,
                 updated_at=NOW()""",
             guild_id, panel_channel_id, category_id,
-            interpolov_role_id, intolerance_role_id,
+            family_role_id,
         )
 
     async def set_application_panel_message(self, guild_id: int, message_id: int) -> None:
@@ -1338,6 +1424,19 @@ class Database:
         if self.pool is None:
             return None
         return await self.pool.fetchrow("SELECT * FROM applications WHERE id=$1", application_id)
+
+    async def get_finalized_ticket_applications(
+        self, guild_id: int
+    ) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        return await self.pool.fetch(
+            """SELECT * FROM applications WHERE guild_id=$1
+            AND status IN('accepted','declined')
+            AND ticket_channel_id IS NOT NULL AND ticket_message_id IS NOT NULL
+            ORDER BY updated_at DESC""",
+            guild_id,
+        )
 
     async def set_application_json_path(self, application_id: int, path: str) -> None:
         if self.pool is not None:
@@ -1510,6 +1609,124 @@ class Database:
             WHERE guild_id=$1 AND role_id=ANY($2::BIGINT[])""",
             guild_id, list(role_ids),
         ))
+
+    async def remove_deleted_role_references(self, guild_id: int, role_id: int) -> None:
+        """Remove/disable every configurable reference to a deleted Discord role."""
+        if self.pool is None:
+            return
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM access_level_roles WHERE guild_id=$1 AND role_id=$2",
+                    guild_id, role_id,
+                )
+                await connection.execute(
+                    """DELETE FROM department_config WHERE guild_id=$1
+                    AND (member_role_id=$2 OR head_role_id=$2)""", guild_id, role_id,
+                )
+                await connection.execute(
+                    """UPDATE game_servers SET role_id=NULL,updated_at=NOW()
+                    WHERE guild_id=$1 AND role_id=$2""",
+                    guild_id, role_id,
+                )
+                await connection.execute(
+                    """UPDATE families SET role_id=NULL,active=FALSE,updated_at=NOW()
+                    WHERE guild_id=$1 AND role_id=$2""",
+                    guild_id, role_id,
+                )
+
+    async def get_game_servers(self, guild_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        return await self.pool.fetch(
+            "SELECT * FROM game_servers WHERE guild_id=$1 ORDER BY name", guild_id
+        )
+
+    async def get_game_server(self, guild_id: int, server_id: int) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            "SELECT * FROM game_servers WHERE guild_id=$1 AND id=$2", guild_id, server_id
+        )
+
+    async def upsert_game_server(
+        self, guild_id: int, name: str, role_id: int | None, added_by: int
+    ) -> asyncpg.Record:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        existing = await self.pool.fetchrow(
+            "SELECT id FROM game_servers WHERE guild_id=$1 AND LOWER(name)=LOWER($2)",
+            guild_id, name,
+        )
+        if existing is not None:
+            return await self.pool.fetchrow(
+                """UPDATE game_servers SET name=$2,role_id=$3,updated_at=NOW()
+                WHERE id=$1 RETURNING *""", existing["id"], name, role_id,
+            )
+        return await self.pool.fetchrow(
+            """INSERT INTO game_servers(guild_id,name,role_id,added_by)
+            VALUES($1,$2,$3,$4) RETURNING *""", guild_id, name, role_id, added_by,
+        )
+
+    async def delete_game_server(self, guild_id: int, name: str) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            """DELETE FROM game_servers WHERE guild_id=$1 AND LOWER(name)=LOWER($2)
+            RETURNING *""", guild_id, name,
+        )
+
+    async def get_families(self, guild_id: int, *, active_only: bool = True) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        suffix = " AND active=TRUE" if active_only else ""
+        return await self.pool.fetch(
+            f"SELECT * FROM families WHERE guild_id=$1{suffix} ORDER BY name", guild_id
+        )
+
+    async def get_family(self, guild_id: int, family_id: int) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            "SELECT * FROM families WHERE guild_id=$1 AND id=$2 AND active=TRUE",
+            guild_id, family_id,
+        )
+
+    async def get_family_by_name(self, guild_id: int, name: str) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            """SELECT * FROM families WHERE guild_id=$1 AND LOWER(name)=LOWER($2)
+            AND active=TRUE""", guild_id, name,
+        )
+
+    async def upsert_family(
+        self, guild_id: int, name: str, role_id: int, added_by: int
+    ) -> asyncpg.Record:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        existing = await self.pool.fetchrow(
+            "SELECT id FROM families WHERE guild_id=$1 AND LOWER(name)=LOWER($2)",
+            guild_id, name,
+        )
+        if existing is not None:
+            return await self.pool.fetchrow(
+                """UPDATE families SET name=$2,role_id=$3,active=TRUE,updated_at=NOW()
+                WHERE id=$1 RETURNING *""", existing["id"], name, role_id,
+            )
+        return await self.pool.fetchrow(
+            """INSERT INTO families(guild_id,name,role_id,added_by)
+            VALUES($1,$2,$3,$4) RETURNING *""", guild_id, name, role_id, added_by,
+        )
+
+    async def delete_family(self, guild_id: int, name: str) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            """UPDATE families SET active=FALSE,updated_at=NOW()
+            WHERE guild_id=$1 AND LOWER(name)=LOWER($2) AND active=TRUE RETURNING *""",
+            guild_id, name,
+        )
 
     async def set_department_config(
         self,

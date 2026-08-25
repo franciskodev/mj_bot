@@ -26,11 +26,10 @@ class ServerTagsCog(commands.Cog):
 
     async def family_role_ids(self) -> set[int]:
         role_ids = set(TARGET_ROLE_IDS)
-        config = await self.bot.database.get_application_config(GUILD_ID)
-        if config is not None:
-            role_ids.update(
-                {config["interpolov_role_id"], config["intolerance_role_id"]}
-            )
+        role_ids.update(
+            row["role_id"] for row in await self.bot.database.get_families(GUILD_ID)
+            if row["role_id"] is not None
+        )
         return role_ids
 
     async def fetch_primary_guild(self, user_id: int) -> dict[str, Any] | None:

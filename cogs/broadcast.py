@@ -166,11 +166,10 @@ class BroadcastCog(commands.Cog):
         role_ids = set(BROADCAST_ROLE_IDS.get(guild_id, set()))
         if guild_id == GUILD_ID:
             role_ids.update(TARGET_ROLE_IDS)
-            config = await self.bot.database.get_application_config(GUILD_ID)
-            if config is not None:
-                role_ids.update(
-                    {config["interpolov_role_id"], config["intolerance_role_id"]}
-                )
+            role_ids.update(
+                row["role_id"] for row in await self.bot.database.get_families(GUILD_ID)
+                if row["role_id"] is not None
+            )
         members: set[disnake.Member] = set()
         for role_id in role_ids:
             role = guild.get_role(role_id)

@@ -1,0 +1,114 @@
+name: Discord commit notifications
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  notify-discord:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send commits to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_COMMITS_WEBHOOK_URL }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+          if not webhook_url:
+              raise SystemExit(
+                  "Repository secret DISCORD_COMMITS_WEBHOOK_URL is not configured"
+              )
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+
+          repository = event.get("repository") or {}
+          repository_name = repository.get("full_name", os.environ["GITHUB_REPOSITORY"])
+          repository_url = repository.get(
+              "html_url", f"https://github.com/{repository_name}"
+          )
+          branch = event.get("ref", os.environ.get("GITHUB_REF", "")).removeprefix(
+              "refs/heads/"
+          )
+          sender = (event.get("sender") or {}).get("login") or (
+              event.get("pusher") or {}
+          ).get("name", "unknown")
+
+          commits = event.get("commits") or []
+          if not commits and event.get("head_commit"):
+              commits = [event["head_commit"]]
+
+          embeds = []
+          for commit in commits[-10:]:
+              commit_id = commit.get("id", "")
+              message = (commit.get("message") or "Без сообщения").strip()
+              title, _, details = message.partition("\n")
+              author = commit.get("author") or {}
+              description = (
+                  f"Автор: **{author.get('name', 'unknown')}**"
+                  + (f"\n\n{details[:3500]}" if details else "")
+              )
+              embeds.append(
+                  {
+                      "title": f"{commit_id[:7]} · {title}"[:256],
+                      "url": commit.get("url") or repository_url,
+                      "description": description,
+                      "color": 0x5865F2,
+                      "timestamp": commit.get("timestamp"),
+                  }
+              )
+
+          if not embeds:
+              embeds.append(
+                  {
+                      "title": "Workflow запущен вручную",
+                      "url": repository_url,
+                      "color": 0x5865F2,
+                  }
+              )
+
+          hidden_count = max(0, len(commits) - len(embeds))
+          content = (
+              f"📦 **[{repository_name}]({repository_url})** · "
+              f"push в `{branch or 'unknown'}` от **{sender}**"
+          )
+          if hidden_count:
+              content += f" · ещё коммитов: **{hidden_count}**"
+
+          payload = json.dumps(
+              {
+                  "username": "GitHub Commits",
+                  "content": content,
+                  "embeds": embeds,
+                  "allowed_mentions": {"parse": []},
+              }
+          ).encode("utf-8")
+          request = Request(
+              webhook_url,
+              data=payload,
+              headers={
+                  "Content-Type": "application/json",
+                  "User-Agent": "GitHub-Actions-Discord-Commits/1.0",
+              },
+              method="POST",
+          )
+          try:
+              with urlopen(request, timeout=20) as response:
+                  if response.status not in (200, 204):
+                      raise RuntimeError(
+                          f"Discord webhook returned HTTP {response.status}"
+                      )
+          except HTTPError as error:
+              raise SystemExit(
+                  f"Discord webhook returned HTTP {error.code}"
+              ) from error
+          PY
