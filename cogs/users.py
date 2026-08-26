@@ -254,11 +254,7 @@ class UsersCog(commands.Cog):
         valid_server_names = {row["name"] for row in server_rows}
         for profile in profiles:
             member = guild.get_member(profile["discord_id"])
-            if (
-                member is None
-                or member.bot
-                or member.guild_permissions.administrator
-            ):
+            if member is None or member.bot:
                 continue
 
             servers = servers_from_roles(member, server_rows)
@@ -272,6 +268,7 @@ class UsersCog(commands.Cog):
             if (
                 servers
                 or profile["profile_status"] != "Активен"
+                or member.guild_permissions.administrator
             ):
                 continue
 

@@ -14,6 +14,7 @@ from access_control import (
 from cogs.activity import ActivityCog
 from cogs.applications import ApplicationsCog
 from cogs.broadcast import BroadcastCog
+from cogs.chat_responses import ChatResponsesCog
 from cogs.core import CoreCog
 from cogs.direct_messages import DirectMessagesCog
 from cogs.general import GeneralCog
@@ -46,6 +47,7 @@ class IntoleranceBot(commands.InteractionBot):
             slash_commands=True,
         )
         self.add_cog(CoreCog(self))
+        self.add_cog(ChatResponsesCog(self))
         self.add_cog(DirectMessagesCog(self))
         self.add_cog(GeneralCog(self))
         self.add_cog(BroadcastCog(self))
