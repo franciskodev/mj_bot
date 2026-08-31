@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable
 
 import disnake
@@ -30,6 +30,12 @@ DEPARTMENT_CHOICES = {
     "Рекрутеры": "recruiters",
     "Контрактники": "contractors",
 }
+
+SECURITY_AUDIT_RETRIES = 5
+SECURITY_AUDIT_MAX_AGE_SECONDS = 30
+KICK_LIMIT = 5
+ROLE_REMOVAL_LIMIT = 10
+SECURITY_WINDOW = timedelta(minutes=60)
 
 
 def normalize_static_id(value: str) -> str:
@@ -183,6 +189,364 @@ class HelpPaginator(disnake.ui.View):
 class SystemsCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
+        self._security_locks: dict[int, asyncio.Lock] = {}
+        self._processed_kick_entries: dict[int, datetime] = {}
+        self._processed_role_update_entries: dict[int, datetime] = {}
+        self._kick_penalties: dict[int, datetime] = {}
+        self._role_removal_penalties: dict[int, datetime] = {}
+
+    async def find_security_audit_entry(
+        self,
+        guild: disnake.Guild,
+        action: disnake.AuditLogAction,
+        target_id: int,
+        *,
+        ignored_entry_ids: set[int] | None = None,
+    ) -> disnake.AuditLogEntry | None:
+        """Wait briefly for Discord to publish and then find an exact audit entry."""
+        for attempt in range(SECURITY_AUDIT_RETRIES):
+            if attempt:
+                await asyncio.sleep(1)
+            try:
+                async for entry in guild.audit_logs(limit=100, action=action):
+                    age = (disnake.utils.utcnow() - entry.created_at).total_seconds()
+                    if age > SECURITY_AUDIT_MAX_AGE_SECONDS:
+                        break
+                    if (
+                        getattr(entry.target, "id", None) == target_id
+                        and (ignored_entry_ids is None or entry.id not in ignored_entry_ids)
+                    ):
+                        return entry
+            except disnake.DiscordException:
+                logging.exception(
+                    "Could not read security audit log in guild %s", guild.id
+                )
+                return None
+        return None
+
+    async def security_actor(
+        self, guild: disnake.Guild, entry: disnake.AuditLogEntry
+    ) -> disnake.Member | None:
+        actor_id = getattr(entry.user, "id", None)
+        if actor_id is None:
+            return None
+        member = guild.get_member(actor_id)
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(actor_id)
+        except disnake.DiscordException:
+            logging.exception(
+                "Could not fetch security audit actor %s in guild %s",
+                actor_id,
+                guild.id,
+            )
+            return None
+
+    async def security_exemption_reason(
+        self, member: disnake.Member
+    ) -> str | None:
+        bot_member = member.guild.me
+        if await member_access_level(self.bot, member) >= 6:
+            return "6-й уровень допуска (разработчик)"
+        if member.id == member.guild.owner_id:
+            return "владелец сервера (Discord не позволяет изменять его роли)"
+        if bot_member is None:
+            return "не удалось определить роль бота"
+        if member.top_role > bot_member.top_role:
+            return "роль пользователя выше роли бота"
+        return None
+
+    @staticmethod
+    def security_role_list(roles: Iterable[disnake.Role]) -> str:
+        value = ", ".join(role.mention for role in roles)
+        if not value:
+            return "нет доступных для снятия ролей"
+        if len(value) > 1500:
+            return value[:1497] + "…"
+        return value
+
+    async def remove_security_actor_roles(
+        self,
+        member: disnake.Member,
+        *,
+        event_name: str,
+        event_details: str,
+        audit_reason: str,
+    ) -> None:
+        lock = self._security_locks.setdefault(member.id, asyncio.Lock())
+        async with lock:
+            exemption = await self.security_exemption_reason(member)
+            if exemption is not None:
+                await send_admin_log(
+                    self.bot,
+                    title=f"🛡️ Защита: {event_name}",
+                    description=(
+                        f"Пользователь: {member.mention} (`{member.id}`)\n"
+                        f"{event_details}\n"
+                        f"Роли не сняты: **{exemption}**."
+                    ),
+                    color=disnake.Color.orange(),
+                )
+                return
+
+            bot_member = member.guild.me
+            if bot_member is None or not bot_member.guild_permissions.manage_roles:
+                await send_admin_log(
+                    self.bot,
+                    title=f"⚠️ Защита не смогла снять роли: {event_name}",
+                    description=(
+                        f"Пользователь: {member.mention} (`{member.id}`)\n"
+                        f"{event_details}\n"
+                        "У бота нет права **Управлять ролями**."
+                    ),
+                    color=disnake.Color.red(),
+                )
+                return
+
+            removable_roles = [
+                role
+                for role in member.roles
+                if not role.is_default()
+                and not role.managed
+                and role < bot_member.top_role
+            ]
+            try:
+                if removable_roles:
+                    await member.remove_roles(
+                        *removable_roles,
+                        reason=audit_reason,
+                        atomic=False,
+                    )
+            except disnake.DiscordException as error:
+                logging.exception(
+                    "Could not remove roles from security actor %s", member.id
+                )
+                await send_admin_log(
+                    self.bot,
+                    title=f"⚠️ Ошибка защиты: {event_name}",
+                    description=(
+                        f"Пользователь: {member.mention} (`{member.id}`)\n"
+                        f"{event_details}\n"
+                        f"Discord не позволил снять роли: `{str(error)[:700]}`"
+                    ),
+                    color=disnake.Color.red(),
+                )
+                return
+
+            await send_admin_log(
+                self.bot,
+                title=f"🚨 Защита: {event_name}",
+                description=(
+                    f"Пользователь: {member.mention} (`{member.id}`)\n"
+                    f"{event_details}\n"
+                    f"Снятые роли: {self.security_role_list(removable_roles)}"
+                ),
+                color=disnake.Color.red(),
+            )
+
+    async def handle_security_deletion(
+        self,
+        guild: disnake.Guild,
+        *,
+        action: disnake.AuditLogAction,
+        target_id: int,
+        event_name: str,
+        target_description: str,
+    ) -> None:
+        if guild.id not in GUILD_IDS:
+            return
+        entry = await self.find_security_audit_entry(guild, action, target_id)
+        actor = await self.security_actor(guild, entry) if entry is not None else None
+        if actor is None:
+            await send_admin_log(
+                self.bot,
+                title=f"⚠️ Защита: не найден виновник ({event_name})",
+                description=(
+                    f"{target_description}\n"
+                    "Проверьте право бота **Просмотр журнала аудита**."
+                ),
+                color=disnake.Color.orange(),
+            )
+            return
+        await self.remove_security_actor_roles(
+            actor,
+            event_name=event_name,
+            event_details=target_description,
+            audit_reason=f"Защита сервера: {event_name}",
+        )
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: disnake.abc.GuildChannel) -> None:
+        await self.handle_security_deletion(
+            channel.guild,
+            action=disnake.AuditLogAction.channel_delete,
+            target_id=channel.id,
+            event_name="удаление канала",
+            target_description=f"Удалён канал **{channel.name}** (`{channel.id}`).",
+        )
+
+    @commands.Cog.listener("on_guild_role_delete")
+    async def security_role_delete(self, role: disnake.Role) -> None:
+        await self.handle_security_deletion(
+            role.guild,
+            action=disnake.AuditLogAction.role_delete,
+            target_id=role.id,
+            event_name="удаление роли",
+            target_description=f"Удалена роль **{role.name}** (`{role.id}`).",
+        )
+
+    async def recent_kick_count(
+        self, guild: disnake.Guild, actor: disnake.Member
+    ) -> int:
+        cutoff = disnake.utils.utcnow() - SECURITY_WINDOW
+        kick_count = 0
+        async for entry in guild.audit_logs(
+            limit=None,
+            after=cutoff,
+            user=actor,
+            action=disnake.AuditLogAction.kick,
+        ):
+            kick_count += 1
+        return kick_count
+
+    @commands.Cog.listener("on_member_remove")
+    async def security_member_remove(self, member: disnake.Member) -> None:
+        if member.guild.id not in GUILD_IDS:
+            return
+
+        now = disnake.utils.utcnow()
+        cutoff = now - SECURITY_WINDOW
+        self._processed_kick_entries = {
+            entry_id: created_at
+            for entry_id, created_at in self._processed_kick_entries.items()
+            if created_at >= cutoff
+        }
+        entry = await self.find_security_audit_entry(
+            member.guild,
+            disnake.AuditLogAction.kick,
+            member.id,
+            ignored_entry_ids=set(self._processed_kick_entries),
+        )
+        if entry is None:
+            return
+        self._processed_kick_entries[entry.id] = entry.created_at
+
+        actor = await self.security_actor(member.guild, entry)
+        if actor is None:
+            return
+        try:
+            kick_count = await self.recent_kick_count(member.guild, actor)
+        except disnake.DiscordException:
+            logging.exception("Could not count recent kicks by member %s", actor.id)
+            return
+        if kick_count <= KICK_LIMIT:
+            return
+
+        last_penalty = self._kick_penalties.get(actor.id)
+        if last_penalty is not None and last_penalty >= cutoff:
+            return
+        self._kick_penalties = {
+            actor_id: penalized_at
+            for actor_id, penalized_at in self._kick_penalties.items()
+            if penalized_at >= cutoff
+        }
+        self._kick_penalties[actor.id] = now
+        await self.remove_security_actor_roles(
+            actor,
+            event_name="массовые кики",
+            event_details=(
+                f"Количество киков за последние 60 минут: "
+                f"**{kick_count}** (лимит: **{KICK_LIMIT}**)."
+            ),
+            audit_reason=(
+                f"Защита сервера: больше {KICK_LIMIT} киков за 60 минут"
+            ),
+        )
+
+    async def recent_removed_role_count(
+        self, guild: disnake.Guild, actor: disnake.Member
+    ) -> int:
+        cutoff = disnake.utils.utcnow() - SECURITY_WINDOW
+        removed_role_count = 0
+        async for entry in guild.audit_logs(
+            limit=None,
+            after=cutoff,
+            user=actor,
+            action=disnake.AuditLogAction.member_role_update,
+        ):
+            # Снятие собственных ролей не относится к ролям других пользователей.
+            if getattr(entry.target, "id", None) == actor.id:
+                continue
+            removed_role_count += len(getattr(entry.before, "roles", ()))
+        return removed_role_count
+
+    @commands.Cog.listener("on_member_update")
+    async def security_member_role_update(
+        self, before: disnake.Member, after: disnake.Member
+    ) -> None:
+        if after.guild.id not in GUILD_IDS:
+            return
+        if {role.id for role in before.roles} <= {role.id for role in after.roles}:
+            return
+
+        now = disnake.utils.utcnow()
+        cutoff = now - SECURITY_WINDOW
+        self._processed_role_update_entries = {
+            entry_id: created_at
+            for entry_id, created_at in self._processed_role_update_entries.items()
+            if created_at >= cutoff
+        }
+        entry = await self.find_security_audit_entry(
+            after.guild,
+            disnake.AuditLogAction.member_role_update,
+            after.id,
+            ignored_entry_ids=set(self._processed_role_update_entries),
+        )
+        if entry is None or not getattr(entry.before, "roles", ()):
+            return
+        self._processed_role_update_entries[entry.id] = entry.created_at
+
+        actor = await self.security_actor(after.guild, entry)
+        if actor is None or (self.bot.user is not None and actor.id == self.bot.user.id):
+            return
+        # Действия пользователя над собственными ролями не входят в общий счётчик.
+        if actor.id == after.id:
+            return
+        try:
+            removed_role_count = await self.recent_removed_role_count(
+                after.guild, actor
+            )
+        except disnake.DiscordException:
+            logging.exception(
+                "Could not count roles recently removed by member %s", actor.id
+            )
+            return
+        if removed_role_count <= ROLE_REMOVAL_LIMIT:
+            return
+
+        last_penalty = self._role_removal_penalties.get(actor.id)
+        if last_penalty is not None and last_penalty >= cutoff:
+            return
+        self._role_removal_penalties = {
+            actor_id: penalized_at
+            for actor_id, penalized_at in self._role_removal_penalties.items()
+            if penalized_at >= cutoff
+        }
+        self._role_removal_penalties[actor.id] = now
+        await self.remove_security_actor_roles(
+            actor,
+            event_name="массовое снятие ролей",
+            event_details=(
+                "Количество снятых с других пользователей ролей за последние "
+                f"60 минут: **{removed_role_count}** "
+                f"(лимит: **{ROLE_REMOVAL_LIMIT}**)."
+            ),
+            audit_reason=(
+                "Защита сервера: больше "
+                f"{ROLE_REMOVAL_LIMIT} снятых ролей за 60 минут"
+            ),
+        )
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: disnake.Role) -> None:

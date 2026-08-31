@@ -1,50 +1,41 @@
-# Agent Instructions
+# Project Standards
 
-## Project
+## Architecture
 
-This is a small Discord bot built with `disnake`.
+- This is an asynchronous Python Discord bot built with `disnake`.
+- Keep commands slash-only; do not add prefix commands.
+- Keep `main.py` as the entry point, `bot.py` for bot setup, feature logic in `cogs/`,
+  shared access rules in `access_control.py`, configuration in `config.py`, and
+  persistence in `database.py`.
+- Prefer small, focused changes and preserve existing behavior unless the request
+  explicitly changes it.
 
-Main files:
+## Access and Discord Scope
 
-- `main.py` - bot entry point and all current logic.
-- `requirements.txt` - Python dependencies.
-- `.env.example` - public environment variable example.
-- `.env` - local secrets file. Never commit or print its contents.
+- Main functionality is limited to guild `1278169762140258367`.
+- Guild `1522843375840268338` is authorized only for the administrator-only DM
+  broadcast command.
+- Enforce command access through the existing access-level system.
+- Security and role-moderation logic must respect Discord role hierarchy and the
+  level 6 developer exemption.
+- Do not remove DM forwarding or the shared `INTERPOLOV & INTOLERANCE` recruitment
+  system unless explicitly requested.
 
-## Bot Rules
+## Security and Configuration
 
-- Keep the bot slash-command only. Do not add prefix commands.
-- The bot's main functionality must work only in guild `1278169762140258367`.
-- Guild `1522843375840268338` is also authorized, but only for the administrator-only
-  DM broadcast command.
-- The broadcast command must stay restricted to Discord administrators.
-- Do not remove DM forwarding to channel `1532839066565873724` unless explicitly requested.
-- On the main guild, broadcast recipients use configured family roles.
-- On guild `1522843375840268338`, broadcast recipients have roles
-  `1522843375965831271` or `1528511540779811046`.
-- The broadcast text is intentionally defined in code as `BROADCAST_TEXT`.
-- The main guild uses a shared `INTERPOLOV & INTOLERANCE` recruitment panel.
-- Recruitment must provide separate forms and accepted roles for `INTERPOLOV`
-  and `INTOLERANCE`.
-- Applications must store and display the selected family.
+- Never print, expose, or commit `.env` values or Discord/database credentials.
+- Keep public placeholders in `.env.example` and runtime constants in `config.py`.
+- Do not commit virtual environments, `__pycache__`, or compiled Python files.
+- Preserve required Discord intents and permissions for member lookup, DM content,
+  audit-log inspection, message delivery, and role management.
 
 ## Development
 
-- Prefer small, focused changes in `main.py`.
-- Keep secrets in `.env`; update `.env.example` only with placeholder values.
-- Do not commit `.env`, virtual environments, `__pycache__`, or compiled Python files.
-- If adding dependencies, update `requirements.txt`.
-- After Python changes, run:
+- Follow the existing asynchronous style and handle Discord/API failures without
+  crashing unrelated bot features.
+- Update `requirements.txt` whenever a Python dependency changes.
+- After Python changes, compile every changed Python file; at minimum run:
 
-```powershell
+```bash
 python -m py_compile main.py
 ```
-
-## Discord Setup Notes
-
-The bot needs these Discord Developer Portal intents enabled:
-
-- `SERVER MEMBERS INTENT` for role-based member lookup.
-- `MESSAGE CONTENT INTENT` for reading and forwarding DM text.
-
-The bot also needs permission to send messages in the DM forwarding channel.
