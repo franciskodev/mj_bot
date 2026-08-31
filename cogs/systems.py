@@ -15,7 +15,7 @@ from access_control import (
     command_access_level,
     member_access_level,
 )
-from config import BLACKLIST_CHANNEL_ID, FAMILY_NAME, GUILD_IDS
+from config import BLACKLIST_CHANNEL_ID, DEVELOPER_USER_ID, FAMILY_NAME, GUILD_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
@@ -247,7 +247,7 @@ class SystemsCog(commands.Cog):
         self, member: disnake.Member
     ) -> str | None:
         bot_member = member.guild.me
-        if await member_access_level(self.bot, member) >= 6:
+        if member.id == DEVELOPER_USER_ID:
             return "6-й уровень допуска (разработчик)"
         if member.id == member.guild.owner_id:
             return "владелец сервера (Discord не позволяет изменять его роли)"
@@ -394,6 +394,73 @@ class SystemsCog(commands.Cog):
             target_id=role.id,
             event_name="удаление роли",
             target_description=f"Удалена роль **{role.name}** (`{role.id}`).",
+        )
+
+    async def ban_unauthorized_bot(self, member: disnake.Member) -> str:
+        try:
+            await member.ban(reason="Защита сервера: запрещённое приглашение бота")
+        except disnake.DiscordException as error:
+            logging.exception("Could not ban unauthorized bot %s", member.id)
+            return f"❌ Не удалось забанить: `{str(error)[:500]}`"
+        return "✅ Автоматически забанен"
+
+    @staticmethod
+    def bot_invite_exemption_reason(member: disnake.Member) -> str | None:
+        if member.id == DEVELOPER_USER_ID:
+            return "6-й уровень допуска (разработчик)"
+        bot_member = member.guild.me
+        if bot_member is not None and member.top_role > bot_member.top_role:
+            return "роль пользователя выше роли бота"
+        return None
+
+    @commands.Cog.listener("on_member_join")
+    async def security_bot_join(self, member: disnake.Member) -> None:
+        if member.guild.id not in GUILD_IDS or not member.bot:
+            return
+
+        entry = await self.find_security_audit_entry(
+            member.guild,
+            disnake.AuditLogAction.bot_add,
+            member.id,
+        )
+        actor = await self.security_actor(member.guild, entry) if entry else None
+        if actor is None:
+            ban_status = await self.ban_unauthorized_bot(member)
+            await send_admin_log(
+                self.bot,
+                title="⚠️ Защита: не найден пригласивший бота",
+                description=(
+                    f"Бот: {member.mention} (`{member.id}`)\n"
+                    f"Статус: {ban_status}\n"
+                    "Проверьте право основного бота **Просмотр журнала аудита**."
+                ),
+                color=disnake.Color.red(),
+            )
+            return
+
+        exemption = self.bot_invite_exemption_reason(actor)
+        if exemption is not None:
+            await send_admin_log(
+                self.bot,
+                title="🛡️ Разрешённое приглашение бота",
+                description=(
+                    f"Пригласивший: {actor.mention} (`{actor.id}`)\n"
+                    f"Бот: {member.mention} (`{member.id}`)\n"
+                    f"Основание: **{exemption}**."
+                ),
+                color=disnake.Color.green(),
+            )
+            return
+
+        ban_status = await self.ban_unauthorized_bot(member)
+        await self.remove_security_actor_roles(
+            actor,
+            event_name="запрещённое приглашение бота",
+            event_details=(
+                f"Приглашённый бот: {member.mention} (`{member.id}`)\n"
+                f"Статус бота: {ban_status}"
+            ),
+            audit_reason="Защита сервера: запрещённое приглашение бота",
         )
 
     async def recent_kick_count(
