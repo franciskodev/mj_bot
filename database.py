@@ -383,6 +383,55 @@ class Database:
                 CREATE INDEX IF NOT EXISTS family_blacklist_active_message_idx
                     ON family_blacklist(channel_message_id) WHERE active=TRUE;
 
+                CREATE TABLE IF NOT EXISTS giveaways (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    message_id BIGINT UNIQUE,
+                    prize TEXT NOT NULL,
+                    created_by BIGINT NOT NULL,
+                    earliest_end_at TIMESTAMPTZ NOT NULL,
+                    latest_end_at TIMESTAMPTZ NOT NULL,
+                    draw_at TIMESTAMPTZ NOT NULL,
+                    winner_count SMALLINT NOT NULL CHECK(winner_count BETWEEN 1 AND 10),
+                    required_role_id BIGINT,
+                    claim_minutes INTEGER NOT NULL DEFAULT 0
+                        CHECK(claim_minutes BETWEEN 0 AND 1440),
+                    claim_deadline TIMESTAMPTZ,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN('active','drawing','claiming','finished','cancelled')),
+                    cancelled_by BIGINT,
+                    finished_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CHECK(earliest_end_at<=draw_at AND draw_at<=latest_end_at),
+                    CHECK(earliest_end_at<latest_end_at)
+                );
+                CREATE INDEX IF NOT EXISTS giveaways_due_idx
+                    ON giveaways(status,draw_at,claim_deadline)
+                    WHERE status IN('active','drawing','claiming');
+                CREATE TABLE IF NOT EXISTS giveaway_entries (
+                    giveaway_id BIGINT NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+                    discord_id BIGINT NOT NULL,
+                    joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY(giveaway_id,discord_id)
+                );
+                CREATE INDEX IF NOT EXISTS giveaway_entries_joined_idx
+                    ON giveaway_entries(giveaway_id,joined_at);
+                CREATE TABLE IF NOT EXISTS giveaway_winners (
+                    id BIGSERIAL PRIMARY KEY,
+                    giveaway_id BIGINT NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+                    discord_id BIGINT NOT NULL,
+                    selected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    confirmed_at TIMESTAMPTZ,
+                    invalidated_at TIMESTAMPTZ,
+                    invalidation_reason TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS giveaway_winners_current_idx
+                    ON giveaway_winners(giveaway_id,discord_id)
+                    WHERE invalidated_at IS NULL;
+                CREATE INDEX IF NOT EXISTS giveaway_winners_history_idx
+                    ON giveaway_winners(giveaway_id,selected_at);
+
                 CREATE TABLE IF NOT EXISTS command_access_levels (
                     guild_id BIGINT NOT NULL,
                     command_name TEXT NOT NULL,
@@ -1521,6 +1570,356 @@ class Database:
             entry_id, removed_by,
         )
 
+    async def create_giveaway(
+        self,
+        guild_id: int,
+        channel_id: int,
+        prize: str,
+        created_by: int,
+        earliest_end_at: datetime,
+        latest_end_at: datetime,
+        draw_at: datetime,
+        winner_count: int,
+        required_role_id: int | None,
+        claim_minutes: int,
+    ) -> asyncpg.Record:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetchrow(
+            """INSERT INTO giveaways(
+                guild_id,channel_id,prize,created_by,earliest_end_at,
+                latest_end_at,draw_at,winner_count,required_role_id,claim_minutes
+            ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""",
+            guild_id,
+            channel_id,
+            prize,
+            created_by,
+            earliest_end_at,
+            latest_end_at,
+            draw_at,
+            winner_count,
+            required_role_id,
+            claim_minutes,
+        )
+
+    async def set_giveaway_message(self, giveaway_id: int, message_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            "UPDATE giveaways SET message_id=$2 WHERE id=$1",
+            giveaway_id,
+            message_id,
+        )
+
+    async def get_giveaway(
+        self, giveaway_id: int, guild_id: int
+    ) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            "SELECT * FROM giveaways WHERE id=$1 AND guild_id=$2",
+            giveaway_id,
+            guild_id,
+        )
+
+    async def get_open_giveaways(self, guild_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        return await self.pool.fetch(
+            """SELECT * FROM giveaways WHERE guild_id=$1
+            AND status IN('active','drawing','claiming')
+            ORDER BY created_at DESC""",
+            guild_id,
+        )
+
+    async def get_due_giveaway_ids(self) -> list[int]:
+        if self.pool is None:
+            return []
+        rows = await self.pool.fetch(
+            """SELECT id FROM giveaways
+            WHERE (status='active' AND draw_at<=NOW())
+               OR status='drawing'
+               OR (status='claiming' AND claim_deadline<=NOW())
+            ORDER BY COALESCE(claim_deadline,draw_at),id"""
+        )
+        return [row["id"] for row in rows]
+
+    async def get_giveaway_entry_count(self, giveaway_id: int) -> int:
+        if self.pool is None:
+            return 0
+        return int(
+            await self.pool.fetchval(
+                "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id=$1",
+                giveaway_id,
+            )
+        )
+
+    async def get_giveaway_candidate_ids(self, giveaway_id: int) -> list[int]:
+        if self.pool is None:
+            return []
+        rows = await self.pool.fetch(
+            """SELECT entry.discord_id FROM giveaway_entries AS entry
+            WHERE entry.giveaway_id=$1 AND NOT EXISTS(
+                SELECT 1 FROM giveaway_winners AS winner
+                WHERE winner.giveaway_id=entry.giveaway_id
+                  AND winner.discord_id=entry.discord_id
+            ) ORDER BY entry.joined_at,entry.discord_id""",
+            giveaway_id,
+        )
+        return [row["discord_id"] for row in rows]
+
+    async def get_current_giveaway_winners(
+        self, giveaway_id: int
+    ) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        return await self.pool.fetch(
+            """SELECT * FROM giveaway_winners WHERE giveaway_id=$1
+            AND invalidated_at IS NULL ORDER BY selected_at,id""",
+            giveaway_id,
+        )
+
+    async def join_giveaway(
+        self, giveaway_id: int, guild_id: int, discord_id: int
+    ) -> str:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                giveaway = await connection.fetchrow(
+                    """SELECT status,draw_at FROM giveaways
+                    WHERE id=$1 AND guild_id=$2 FOR UPDATE""",
+                    giveaway_id,
+                    guild_id,
+                )
+                if giveaway is None:
+                    return "missing"
+                if giveaway["status"] != "active" or giveaway["draw_at"] <= datetime.now(timezone.utc):
+                    return "expired"
+                inserted = await connection.fetchval(
+                    """INSERT INTO giveaway_entries(giveaway_id,discord_id)
+                    VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING discord_id""",
+                    giveaway_id,
+                    discord_id,
+                )
+                return "joined" if inserted is not None else "already"
+
+    async def leave_giveaway(
+        self, giveaway_id: int, guild_id: int, discord_id: int
+    ) -> str:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                giveaway = await connection.fetchrow(
+                    """SELECT status,draw_at FROM giveaways
+                    WHERE id=$1 AND guild_id=$2 FOR UPDATE""",
+                    giveaway_id,
+                    guild_id,
+                )
+                if giveaway is None:
+                    return "missing"
+                if giveaway["status"] != "active" or giveaway["draw_at"] <= datetime.now(timezone.utc):
+                    return "expired"
+                result = await connection.execute(
+                    """DELETE FROM giveaway_entries
+                    WHERE giveaway_id=$1 AND discord_id=$2""",
+                    giveaway_id,
+                    discord_id,
+                )
+                return "left" if result != "DELETE 0" else "not_joined"
+
+    async def prepare_giveaway_draw(
+        self, giveaway_id: int, guild_id: int, mode: str
+    ) -> tuple[asyncpg.Record, int] | None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        if mode not in {"scheduled", "end", "reroll"}:
+            raise ValueError("Unknown giveaway draw mode")
+
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                giveaway = await connection.fetchrow(
+                    """SELECT * FROM giveaways
+                    WHERE id=$1 AND guild_id=$2 FOR UPDATE""",
+                    giveaway_id,
+                    guild_id,
+                )
+                if giveaway is None:
+                    return None
+
+                status = giveaway["status"]
+                now = datetime.now(timezone.utc)
+                if mode == "scheduled":
+                    if status == "active":
+                        if giveaway["draw_at"] > now:
+                            return None
+                    elif status == "claiming":
+                        if giveaway["claim_deadline"] is None or giveaway["claim_deadline"] > now:
+                            return None
+                        await connection.execute(
+                            """UPDATE giveaway_winners SET invalidated_at=NOW(),
+                            invalidation_reason='Время подтверждения истекло'
+                            WHERE giveaway_id=$1 AND invalidated_at IS NULL
+                            AND confirmed_at IS NULL""",
+                            giveaway_id,
+                        )
+                    elif status != "drawing":
+                        return None
+                elif mode == "end":
+                    if status != "active":
+                        return None
+                else:
+                    if status not in {"finished", "claiming"}:
+                        return None
+                    await connection.execute(
+                        """UPDATE giveaway_winners SET invalidated_at=NOW(),
+                        invalidation_reason='Перевыбор администратором'
+                        WHERE giveaway_id=$1 AND invalidated_at IS NULL""",
+                        giveaway_id,
+                    )
+
+                if status != "drawing":
+                    giveaway = await connection.fetchrow(
+                        """UPDATE giveaways SET status='drawing',claim_deadline=NULL,
+                        finished_at=NULL WHERE id=$1 RETURNING *""",
+                        giveaway_id,
+                    )
+                current_count = int(
+                    await connection.fetchval(
+                        """SELECT COUNT(*) FROM giveaway_winners
+                        WHERE giveaway_id=$1 AND invalidated_at IS NULL""",
+                        giveaway_id,
+                    )
+                )
+                return giveaway, max(giveaway["winner_count"] - current_count, 0)
+
+    async def complete_giveaway_draw(
+        self, giveaway_id: int, winner_ids: list[int]
+    ) -> asyncpg.Record | None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                giveaway = await connection.fetchrow(
+                    "SELECT * FROM giveaways WHERE id=$1 FOR UPDATE",
+                    giveaway_id,
+                )
+                if giveaway is None or giveaway["status"] != "drawing":
+                    return None
+                for discord_id in winner_ids:
+                    await connection.execute(
+                        """INSERT INTO giveaway_winners(
+                            giveaway_id,discord_id,confirmed_at
+                        ) VALUES($1,$2,CASE WHEN $3=0 THEN NOW() ELSE NULL END)""",
+                        giveaway_id,
+                        discord_id,
+                        giveaway["claim_minutes"],
+                    )
+
+                current_count = int(
+                    await connection.fetchval(
+                        """SELECT COUNT(*) FROM giveaway_winners
+                        WHERE giveaway_id=$1 AND invalidated_at IS NULL""",
+                        giveaway_id,
+                    )
+                )
+                unconfirmed_count = int(
+                    await connection.fetchval(
+                        """SELECT COUNT(*) FROM giveaway_winners
+                        WHERE giveaway_id=$1 AND invalidated_at IS NULL
+                        AND confirmed_at IS NULL""",
+                        giveaway_id,
+                    )
+                )
+                if current_count and unconfirmed_count:
+                    return await connection.fetchrow(
+                        """UPDATE giveaways SET status='claiming',
+                        claim_deadline=NOW()+($2*INTERVAL '1 minute')
+                        WHERE id=$1 RETURNING *""",
+                        giveaway_id,
+                        giveaway["claim_minutes"],
+                    )
+                return await connection.fetchrow(
+                    """UPDATE giveaways SET status='finished',claim_deadline=NULL,
+                    finished_at=NOW() WHERE id=$1 RETURNING *""",
+                    giveaway_id,
+                )
+
+    async def claim_giveaway(
+        self, giveaway_id: int, guild_id: int, discord_id: int
+    ) -> str:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                giveaway = await connection.fetchrow(
+                    """SELECT * FROM giveaways
+                    WHERE id=$1 AND guild_id=$2 FOR UPDATE""",
+                    giveaway_id,
+                    guild_id,
+                )
+                if giveaway is None:
+                    return "missing"
+                if (
+                    giveaway["status"] != "claiming"
+                    or giveaway["claim_deadline"] is None
+                    or giveaway["claim_deadline"] <= datetime.now(timezone.utc)
+                ):
+                    return "expired"
+                winner = await connection.fetchrow(
+                    """SELECT * FROM giveaway_winners WHERE giveaway_id=$1
+                    AND discord_id=$2 AND invalidated_at IS NULL FOR UPDATE""",
+                    giveaway_id,
+                    discord_id,
+                )
+                if winner is None:
+                    return "not_winner"
+                if winner["confirmed_at"] is not None:
+                    return "already"
+                await connection.execute(
+                    "UPDATE giveaway_winners SET confirmed_at=NOW() WHERE id=$1",
+                    winner["id"],
+                )
+                unconfirmed = await connection.fetchval(
+                    """SELECT EXISTS(SELECT 1 FROM giveaway_winners
+                    WHERE giveaway_id=$1 AND invalidated_at IS NULL
+                    AND confirmed_at IS NULL)""",
+                    giveaway_id,
+                )
+                if not unconfirmed:
+                    await connection.execute(
+                        """UPDATE giveaways SET status='finished',claim_deadline=NULL,
+                        finished_at=NOW() WHERE id=$1""",
+                        giveaway_id,
+                    )
+                return "claimed"
+
+    async def cancel_giveaway(
+        self, giveaway_id: int, guild_id: int, cancelled_by: int
+    ) -> asyncpg.Record | None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                giveaway = await connection.fetchrow(
+                    """UPDATE giveaways SET status='cancelled',cancelled_by=$3,
+                    claim_deadline=NULL,finished_at=NOW()
+                    WHERE id=$1 AND guild_id=$2
+                    AND status IN('active','drawing','claiming') RETURNING *""",
+                    giveaway_id,
+                    guild_id,
+                    cancelled_by,
+                )
+                if giveaway is not None:
+                    await connection.execute(
+                        """UPDATE giveaway_winners SET invalidated_at=NOW(),
+                        invalidation_reason='Розыгрыш отменён'
+                        WHERE giveaway_id=$1 AND invalidated_at IS NULL""",
+                        giveaway_id,
+                    )
+                return giveaway
+
     async def get_command_access_level(
         self, guild_id: int, command_name: str
     ) -> int | None:
@@ -1632,6 +2031,12 @@ class Database:
                 await connection.execute(
                     """UPDATE families SET role_id=NULL,active=FALSE,updated_at=NOW()
                     WHERE guild_id=$1 AND role_id=$2""",
+                    guild_id, role_id,
+                )
+                await connection.execute(
+                    """UPDATE giveaways SET required_role_id=NULL
+                    WHERE guild_id=$1 AND required_role_id=$2
+                    AND status IN('active','drawing','claiming')""",
                     guild_id, role_id,
                 )
 

@@ -18,6 +18,7 @@ from cogs.chat_responses import ChatResponsesCog
 from cogs.core import CoreCog
 from cogs.direct_messages import DirectMessagesCog
 from cogs.general import GeneralCog
+from cogs.giveaways import GiveawaysCog
 from cogs.leave import LeaveCog
 from cogs.meetings import MeetingsCog
 from cogs.management import ManagementCog
@@ -50,6 +51,7 @@ class IntoleranceBot(commands.InteractionBot):
         self.add_cog(ChatResponsesCog(self))
         self.add_cog(DirectMessagesCog(self))
         self.add_cog(GeneralCog(self))
+        self.add_cog(GiveawaysCog(self))
         self.add_cog(BroadcastCog(self))
         self.add_cog(UsersCog(self))
         self.add_cog(ActivityCog(self))

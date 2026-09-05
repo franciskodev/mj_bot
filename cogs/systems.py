@@ -258,6 +258,11 @@ class SystemsCog(commands.Cog):
         return None
 
     @staticmethod
+    def is_current_bot(member: disnake.Member) -> bool:
+        bot_member = member.guild.me
+        return bot_member is not None and member.id == bot_member.id
+
+    @staticmethod
     def security_role_list(roles: Iterable[disnake.Role]) -> str:
         value = ", ".join(role.mention for role in roles)
         if not value:
@@ -368,6 +373,8 @@ class SystemsCog(commands.Cog):
                 ),
                 color=disnake.Color.orange(),
             )
+            return
+        if self.is_current_bot(actor):
             return
         await self.remove_security_actor_roles(
             actor,
@@ -575,7 +582,7 @@ class SystemsCog(commands.Cog):
         self._processed_role_update_entries[entry.id] = entry.created_at
 
         actor = await self.security_actor(after.guild, entry)
-        if actor is None or (self.bot.user is not None and actor.id == self.bot.user.id):
+        if actor is None or self.is_current_bot(actor):
             return
         # Действия пользователя над собственными ролями не входят в общий счётчик.
         if actor.id == after.id:
