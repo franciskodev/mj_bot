@@ -12,6 +12,7 @@ from access_control import has_family_role, member_access_level
 from config import GUILD_ID, GUILD_IDS
 from cogs import mafia_game as rules
 from cogs.mafia_rooms import MafiaRooms
+from cogs.mafia_notifications import deliver_notifications
 
 if TYPE_CHECKING:
     from bot import IntoleranceBot
@@ -38,6 +39,8 @@ def game_embed(game: dict) -> disnake.Embed:
         description += "\n⏸️ Игра на паузе."
     if state.get("setup_pending"):
         description += "\nПодготовка комнат и временное снятие админских ролей."
+    if state.get('confirmation_pending'):
+        description += '\nОжидаем подтверждения всех игроков. Если ЛС закрыты, нажмите кнопку на этой панели.'
     if state.get("room_error"):
         description += "\n⚠️ Проверьте права бота и положение его роли. Подготовка будет повторена."
     if game.get('restore_pending'):
@@ -46,23 +49,29 @@ def game_embed(game: dict) -> disnake.Embed:
         description += f"\nКонец фазы: <t:{int(state['deadline'])}:R>"
     if state["winner"]:
         description += "\n**" + {"town": "Победил город!", "mafia": "Победила мафия!", "draw": "Ничья!"}[state["winner"]] + "**"
+    if state.get('rooms_deleted'):
+        description += '\nКомнаты партии удалены. Результат сохранён.'
+    elif state.get('cleanup_at') is not None:
+        description += f"\nУдаление комнат: <t:{int(state['cleanup_at'])}:R>. Результат доступен через `/mafia status game_id:{game['id']}`."
     embed = disnake.Embed(title=f"🎭 Мафия #{game['id']}", description=description, color=disnake.Color.dark_purple())
     players = []
     for uid, player in state["players"].items():
         text = f"{'🟢' if player['alive'] else '💀'} <@{uid}>"
+        if state.get('confirmation_pending'):
+            text += ' — ✅ готов' if uid in state.get('confirmations', []) else ' — ⏳ ждём подтверждения'
         if state["phase"] in {"finished", "cancelled"} and player["role"]:
             text += f" — {rules.ROLES[player['role']]}"
         players.append(text)
     embed.add_field(name=f"Игроки ({len(players)}/12)", value="\n".join(players) or "Пока никого", inline=False)
     embed.add_field(name="Организатор", value=f"<@{state['host_id']}>")
-    if state["voice_id"]:
+    if state["voice_id"] and not state.get('rooms_deleted'):
         embed.add_field(name="Обсуждение голосом", value=f"<#{state['voice_id']}>")
     if state["phase"] == "vote":
         embed.add_field(name="Голосование", value=f"Проголосовали: {len(state['votes'])}")
     if state["phase"] == "lobby":
         embed.add_field(
             name="Правила",
-            value="6–8 игроков: 2 мафии; 9–12: 3 мафии. Также 1 доктор, 1 комиссар, остальные — мирные.\n"
+            value="5 игроков: 1 мафия; 6–8: 2 мафии; 9–12: 3 мафии. Также 1 доктор, 1 комиссар, остальные — мирные.\n"
                   "Ночь — 60 с, обсуждение — 120 с, голосование — 60 с. "
                   "При равенстве голосов никто не выбывает; можно воздержаться.\n"
                   "Вступить можно только с семейной ролью. Выбывшие не голосуют; ночью общий войс закрыт для речи. "
@@ -84,10 +93,17 @@ def game_buttons(game: dict) -> list[disnake.ui.Button]:
             ("leave", "Выйти", disnake.ButtonStyle.secondary),
             ("start", "Начать", disnake.ButtonStyle.primary),
         ]
+        if state.get('confirmation_pending'):
+            actions = [
+                ("confirm_start", "Подтверждаю участие", disnake.ButtonStyle.success),
+                ("leave", "Выйти", disnake.ButtonStyle.secondary),
+            ]
     else:
         actions.append(("pause", "Продолжить" if state["paused"] else "Пауза", disnake.ButtonStyle.secondary))
     actions.append(("stop", "Остановить", disnake.ButtonStyle.danger))
-    return [disnake.ui.Button(label=label, style=style, custom_id=f"mafia:{action}:{game['id']}") for action, label, style in actions]
+    return [disnake.ui.Button(label=label, style=style,
+                             custom_id=f"mafia:{action}:{game['id']}" + (f":{state['token']}" if action == 'confirm_start' else ''))
+            for action, label, style in actions]
 
 
 def private_panel(game: dict, user_id: int) -> tuple[str, list]:
@@ -174,6 +190,11 @@ class MafiaCog(commands.Cog):
             game = await self.bot.database.get_mafia_game(GUILD_ID, game_id)
             if game is None or (not force and game["message_revision"] >= game["revision"]):
                 return
+            if game['state'].get('rooms_deleted') or (
+                game['state'].get('cleanup_at') is not None
+                and disnake.utils.utcnow().timestamp() >= game['state']['cleanup_at']
+            ):
+                return
             if game['state']['phase'] not in rules.ACTIVE_PHASES:
                 game['restore_pending'] = len(await self.bot.database.get_mafia_role_holds(game_id))
             channel = self.bot.get_channel(game["channel_id"])
@@ -188,7 +209,7 @@ class MafiaCog(commands.Cog):
                         message = await channel.fetch_message(game["message_id"])
                     except disnake.NotFound:
                         pass
-                kwargs = dict(embed=game_embed(game), components=game_buttons(game), allowed_mentions=disnake.AllowedMentions.none())
+                kwargs = dict(content=None, embed=game_embed(game), components=game_buttons(game), allowed_mentions=disnake.AllowedMentions.none())
                 if message is None:
                     message = await channel.send(**kwargs)
                 else:
@@ -205,12 +226,29 @@ class MafiaCog(commands.Cog):
     def game_lock(self, game_id: int) -> asyncio.Lock:
         return self._game_locks.setdefault(game_id, asyncio.Lock())
 
+    async def finish_game_resources(self, game: dict) -> None:
+        try:
+            await self.rooms.restore_admin_roles(game['id'])
+        finally:
+            # Role restoration, event delivery and cleanup must not block each other.
+            if not game['state'].get('rooms_deleted'):
+                cleanup_at = game['state'].get('cleanup_at')
+                if cleanup_at is not None and disnake.utils.utcnow().timestamp() >= cleanup_at:
+                    await self.rooms.delete_game_rooms(game)
+                else:
+                    if game['state'].get('rooms'):
+                        await self.rooms.sync_permissions(game)
+                    await self.rooms.send_events(game)
+
     async def maintain_game(self, game_id: int) -> None:
         game = await self.bot.database.get_mafia_game(GUILD_ID, game_id)
         if game is None:
             return
         state = game['state']
         ended = state['phase'] not in rules.ACTIVE_PHASES
+        if ended:
+            await self.finish_game_resources(game)
+            return
         fingerprint = repr((state['phase'], state['paused'], state.get('setup_pending'),
                             [(uid, p['alive'], p['role']) for uid, p in state['players'].items()]))
         previous, checked_at = self._room_sync.get(game_id, ('', 0))
@@ -221,6 +259,9 @@ class MafiaCog(commands.Cog):
                     game = await self.rooms.reconcile_players(game)
                     state = game['state']
                     ended = state['phase'] not in rules.ACTIVE_PHASES
+                    if ended:
+                        await self.finish_game_resources(game)
+                        return
                 if not ended:
                     game = await self.rooms.ensure_rooms(game)
                     if state['phase'] != 'lobby':
@@ -249,10 +290,6 @@ class MafiaCog(commands.Cog):
                         rules.toggle_pause(current_state, disnake.utils.utcnow().timestamp())
                     current_state['room_error'] = True
             raise
-        finally:
-            # Restoration never depends on a channel being present or writable.
-            if ended:
-                await self.rooms.restore_admin_roles(game_id)
         await self.rooms.send_events(game)
 
     @tasks.loop(seconds=5)
@@ -275,10 +312,29 @@ class MafiaCog(commands.Cog):
                     await self.sync_message(row['id'])
                 except Exception:
                     logging.exception('Could not display mafia recovery status')
+        try:
+            await deliver_notifications(self.bot)
+        except Exception:
+            logging.exception('Could not deliver Mafia personal notifications')
 
     @tick.before_loop
     async def before_tick(self) -> None:
         await self.bot.wait_until_ready()
+
+    @commands.Cog.listener('on_ready')
+    async def restore_mafia_panels(self) -> None:
+        try:
+            games = await self.bot.database.pending_mafia_games(GUILD_ID)
+            for row in games:
+                try:
+                    async with self.game_lock(row['id']):
+                        game = await self.bot.database.get_mafia_game(GUILD_ID, row['id'])
+                        if game is not None and game['state']['phase'] in rules.ACTIVE_PHASES:
+                            await self.sync_message(row['id'], force=True)
+                except Exception:
+                    logging.exception('Could not restore mafia panel %s', row['id'])
+        except Exception:
+            logging.exception('Could not load mafia panels for restoration')
 
     @commands.slash_command(name="mafia", description="Мафия: игры и рейтинги", guild_ids=GUILD_IDS)
     async def mafia(self, inter: disnake.ApplicationCommandInteraction) -> None:
@@ -327,6 +383,8 @@ class MafiaCog(commands.Cog):
             await inter.edit_original_response("Игра не найдена.")
             return
         await self.sync_message(game["id"], force=True)
+        if game['state']['phase'] not in rules.ACTIVE_PHASES:
+            game['restore_pending'] = len(await self.bot.database.get_mafia_role_holds(game['id']))
         await inter.edit_original_response(embed=game_embed(game), components=game_buttons(game))
 
     @mafia.sub_command(name="top", description="Рейтинги игроков в мафию")
@@ -364,11 +422,14 @@ class MafiaCog(commands.Cog):
 
     async def handle_component(self, inter: disnake.MessageInteraction) -> None:
         custom_id = inter.component.custom_id or ''
-        if not custom_id.startswith('mafia:') or inter.guild_id != GUILD_ID:
+        dm_confirmation = inter.guild_id is None and custom_id.startswith('mafia:confirm_start:')
+        if not custom_id.startswith('mafia:') or (inter.guild_id != GUILD_ID and not dm_confirmation):
             return
-        if not isinstance(inter.author, disnake.Member):
+        if not dm_confirmation and not isinstance(inter.author, disnake.Member):
             return
-        await inter.response.defer(ephemeral=True)
+        # Components default to updating the source message. A separate deferred
+        # response is required for private errors, roles and target menus.
+        await inter.response.defer(with_message=True, ephemeral=True)
         try:
             game_id = int(custom_id.split(':')[2])
         except (ValueError, IndexError):
@@ -381,15 +442,27 @@ class MafiaCog(commands.Cog):
         custom_id = inter.component.custom_id or ""
         if not custom_id.startswith("mafia:"):
             return
-        if inter.guild_id != GUILD_ID or not isinstance(inter.author, disnake.Member):
+        dm_confirmation = inter.guild_id is None and custom_id.startswith('mafia:confirm_start:')
+        if inter.guild_id != GUILD_ID and not dm_confirmation:
             return
         try:
             parts = custom_id.split(":")
             action, game_id = parts[1], int(parts[2])
-            level = await member_access_level(self.bot, inter.author)
-            if inter.author.bot:
+            member = inter.author
+            if dm_confirmation:
+                guild = self.bot.get_guild(GUILD_ID)
+                if guild is None:
+                    raise rules.GameError('Сервер игры недоступен. Попробуйте позже.')
+                try:
+                    member = await guild.fetch_member(inter.author.id)
+                except disnake.NotFound:
+                    raise rules.GameError('Для подтверждения нужно состоять на сервере игры.')
+            if not isinstance(member, disnake.Member):
+                return
+            level = await member_access_level(self.bot, member)
+            if member.bot:
                 raise rules.GameError("Боты не могут играть.")
-            if action in {'join', 'role', 'act'} and not await has_family_role(self.bot, inter.author):
+            if action in {'join', 'role', 'act', 'confirm_start'} and not await has_family_role(self.bot, member):
                 raise rules.GameError("Участие доступно только с семейной ролью.")
             if action in {"start", "pause", "stop", "confirm_stop"} and level < 5:
                 raise rules.GameError("Управлять игрой можно с 5 уровня допуска.")
@@ -410,9 +483,18 @@ class MafiaCog(commands.Cog):
                     text = "Вы вышли из лобби."
                 elif action == "start":
                     await self.rooms.preflight_start(game)
-                    rules.start(state, now)
-                    state.update(setup_pending=True, paused=True, remaining=rules.DURATIONS['night'], deadline=None)
-                    text = "Подготовка игры: бот создаёт комнаты и временно снимает админские роли с сохранением допуска."
+                    rules.request_start(state)
+                    text = 'Запуск объявлен. Ожидаем подтверждения всех игроков в ЛС или на панели игры.'
+                elif action == 'confirm_start':
+                    if len(parts) != 4:
+                        raise rules.GameError('Некорректное подтверждение.')
+                    ready = rules.confirm_start(state, member.id, int(parts[3]))
+                    text = 'Участие подтверждено. Ожидаем остальных игроков.'
+                    if ready:
+                        await self.rooms.preflight_start(game)
+                        rules.start(state, now)
+                        state.update(setup_pending=True, paused=True, remaining=rules.DURATIONS['night'], deadline=None)
+                        text = 'Все подтвердили участие. Бот подготавливает комнаты и роли; затем начнётся первая ночь.'
                 elif action == "pause":
                     rules.toggle_pause(state, now)
                     text = "Игра на паузе." if state["paused"] else "Игра продолжена."

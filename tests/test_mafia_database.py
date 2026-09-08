@@ -11,6 +11,7 @@ import asyncpg
 
 from cogs import mafia_game as rules
 from database import Database
+from config import MAFIA_CLEANUP_DELAY_SECONDS
 
 
 class DatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -51,7 +52,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         source = (Path(__file__).resolve().parents[1] / 'database.py').read_text()
         schema = source.split('CREATE TABLE IF NOT EXISTS mafia_games (', 1)[1].split('CREATE TABLE IF NOT EXISTS giveaways (', 1)[0]
         await self.db.pool.execute('CREATE TABLE IF NOT EXISTS mafia_games (' + schema)
-        await self.db.pool.execute('TRUNCATE mafia_events,mafia_role_holds,mafia_results,mafia_games RESTART IDENTITY')
+        await self.db.pool.execute('TRUNCATE mafia_notifications,mafia_events,mafia_role_holds,mafia_results,mafia_games RESTART IDENTITY')
 
     async def asyncTearDown(self):
         await self.db.pool.close()
@@ -193,6 +194,64 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.mark_mafia_event_sent(events[0]['id'], 222)
         self.assertEqual(await self.db.get_mafia_events(game_id), [])
 
+    async def test_personal_notifications_commit_with_action_and_survive_restart(self):
+        game_id = await self.create_started_game()
+        with self.assertRaises(RuntimeError):
+            async with self.db.mafia_transaction(1, game_id) as game:
+                rules.act(game['state'], 4, '1', 1, 110)
+                raise RuntimeError('rollback')
+        self.assertEqual(await self.db.get_mafia_notifications(1), [])
+        async with self.db.mafia_transaction(1, game_id) as game:
+            rules.act(game['state'], 4, '1', 1, 110)
+        reopened = Database()
+        reopened.pool = self.db.pool
+        rows = await reopened.get_mafia_notifications(1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['discord_id'], 4)
+        self.assertIn('Мафия', rows[0]['payload'])
+        self.assertEqual(await reopened.get_mafia_notifications(2), [])
+        self.assertEqual(await reopened.get_mafia_events(game_id), [])
+        await reopened.retry_mafia_notification(rows[0]['id'])
+        self.assertEqual(await reopened.get_mafia_notifications(1), [])
+        await self.db.pool.execute('UPDATE mafia_notifications SET next_attempt_at=NOW()')
+        self.assertEqual(len(await reopened.get_mafia_notifications(1)), 1)
+        await reopened.finish_mafia_notification(rows[0]['id'], 55)
+        async with reopened.mafia_transaction(1, game_id) as game:
+            game['state']['rooms'] = {'events': 123}
+        self.assertEqual(await reopened.get_mafia_notifications(1), [])
+
+    async def test_readiness_is_durable_and_concurrent_last_confirmations_start_once(self):
+        state = rules.new_game(1)
+        for uid in range(1, 6):
+            rules.join(state, uid, str(uid))
+        game_id = await self.db.create_mafia_game(1, 123, state)
+        async with self.db.mafia_transaction(1, game_id) as game:
+            rules.request_start(game['state'])
+        game = await self.db.get_mafia_game(1, game_id)
+        token = game['state']['token']
+        self.assertIsNone(game['state']['deadline'])
+        self.assertEqual(len(await self.db.get_mafia_notifications(1)), 5)
+        async with self.db.mafia_transaction(1, game_id) as game:
+            for uid in range(1, 5):
+                rules.confirm_start(game['state'], uid, token)
+        reopened = Database()
+        reopened.pool = self.db.pool
+        self.assertEqual(len((await reopened.get_mafia_game(1, game_id))['state']['confirmations']), 4)
+
+        async def confirm():
+            async with reopened.mafia_transaction(1, game_id) as game:
+                if rules.confirm_start(game['state'], 5, token):
+                    rules.start(game['state'], 100)
+                    game['state'].update(setup_pending=True, paused=True, deadline=None)
+
+        outcomes = await asyncio.gather(confirm(), confirm(), return_exceptions=True)
+        self.assertEqual(sum(isinstance(result, rules.GameError) for result in outcomes), 1)
+        game = await reopened.get_mafia_game(1, game_id)
+        self.assertEqual(game['state']['phase'], 'night')
+        self.assertTrue(game['state']['setup_pending'])
+        self.assertEqual(sum(p['role'] == 'mafia' for p in game['state']['players'].values()), 1)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM mafia_notifications WHERE payload->>'kind'='role'"), 0)
+
     async def test_existing_role_hold_schema_upgrades_to_level_six(self):
         game_id = await self.create_started_game()
         await self.db.hold_mafia_roles(game_id, 1, 1, [100], 5)
@@ -209,6 +268,35 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.get_mafia_saved_access(1, 2), 6)
         await self.db.pool.execute(migration)
         self.assertEqual(await self.db.get_mafia_saved_access(1, 2), 6)
+
+    async def test_cleanup_schedule_and_pending_recovery_survive_restart(self):
+        for phase in ('finished', 'cancelled'):
+            game_id = await self.create_started_game()
+            before = await self.db.pool.fetchval('SELECT EXTRACT(EPOCH FROM NOW())::DOUBLE PRECISION')
+            async with self.db.mafia_transaction(1, game_id) as game:
+                game['state']['rooms_enabled'] = True
+                if phase == 'finished':
+                    rules.finish(game['state'], 'town')
+                else:
+                    rules.cancel(game['state'])
+            reopened = Database()
+            reopened.pool = self.db.pool
+            game = await reopened.get_mafia_game(1, game_id)
+            deadline = game['state']['cleanup_at']
+            self.assertGreaterEqual(deadline, before + MAFIA_CLEANUP_DELAY_SECONDS)
+            self.assertLess(deadline, before + MAFIA_CLEANUP_DELAY_SECONDS + 5)
+            await reopened.set_mafia_message(game_id, 999, game['revision'])
+            for event in await reopened.get_mafia_events(game_id):
+                await reopened.mark_mafia_event_sent(event['id'], 1000 + event['id'])
+            self.assertIn(game_id, [r['id'] for r in await reopened.pending_mafia_games(1)])
+            await reopened.hold_mafia_roles(game_id, 1, 1, [100], 5)
+            async with reopened.mafia_transaction(1, game_id) as game:
+                game['state']['rooms_deleted'] = True
+            self.assertEqual((await reopened.get_mafia_game(1, game_id))['state']['cleanup_at'], deadline)
+            self.assertIn(game_id, [r['id'] for r in await reopened.pending_mafia_games(1)])
+            await reopened.finish_mafia_role_hold(game_id, 1)
+            self.assertNotIn(game_id, [r['id'] for r in await reopened.pending_mafia_games(1)])
+        self.assertEqual(await self.db.pool.fetchval('SELECT COUNT(*) FROM mafia_results'), 6)
 
 
 if __name__ == '__main__':

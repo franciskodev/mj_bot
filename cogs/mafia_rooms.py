@@ -49,6 +49,7 @@ def room_overwrites(guild, state: dict, kind: str, family_ids: set[int]) -> dict
             view_channel=True, send_messages=True, read_message_history=True,
             connect=True, speak=True, manage_channels=True, manage_roles=True,
             embed_links=True, attach_files=True, move_members=True,
+            mention_everyone=kind == 'events',
         )
     public = kind in {'category', 'events', 'discussion'}
     ended = state['phase'] in {'finished', 'cancelled'}
@@ -66,15 +67,15 @@ def room_overwrites(guild, state: dict, kind: str, family_ids: set[int]) -> dict
             continue
         alive = player['alive']
         night = state['phase'] == 'night' and not state['paused']
-        day = state['phase'] in {'lobby', 'day', 'vote'} and not state['paused']
+        discussion_open = state['phase'] in {'lobby', 'day'} and not state['paused']
         view = public
         connect = speak = send = False
         if kind == 'discussion':
-            send = alive and day and not ended
+            send = alive and discussion_open and not ended
         elif kind == 'discussion_voice':
             view = True
             connect = alive and not ended
-            speak = connect and day
+            speak = connect and discussion_open
         elif kind == 'dead_voice':
             view = not alive or ended
             connect = not alive and not ended
@@ -126,6 +127,8 @@ class MafiaRooms:
         if not state.get('room_key'):
             game = await self.patch_state(game_id, room_key=secrets.token_hex(4), rooms_enabled=True)
             state = game['state']
+        game = await self.sync_participant_role(game)
+        state = game['state']
         families = await family_role_ids(self.bot, GUILD_ID)
         category_id = state.get('rooms', {}).get('category')
         category = guild.get_channel(category_id) if category_id else None
@@ -159,11 +162,60 @@ class MafiaRooms:
                 game = await self.remember_room(game_id, kind, channel.id)
         return game
 
+    @staticmethod
+    def participant_role_name(game: dict) -> str:
+        return f"Мафия #{game['id']} · {game['state']['room_key']}"
+
+    async def sync_participant_role(self, game: dict) -> dict:
+        state = game['state']
+        if state.get('rooms_deleted') or not state.get('room_key'):
+            return game
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None or guild.me is None:
+            raise rules.GameError('Сервер недоступен.')
+        roles = await guild.fetch_roles()
+        role = next((r for r in roles if r.id == state.get('participant_role_id')), None)
+        if role is None:
+            role = next((r for r in roles if r.name == self.participant_role_name(game)), None)
+        if role is None:
+            # Never create new resources for an already completed legacy game.
+            if state['phase'] not in rules.ACTIVE_PHASES:
+                return game
+            role = await guild.create_role(
+                name=self.participant_role_name(game), permissions=disnake.Permissions.none(),
+                hoist=False, mentionable=False, reason=f"Мафия #{game['id']}: роль участников",
+            )
+        if role.is_default() or role.managed or role.permissions.value:
+            raise rules.GameError('Роль участников мафии должна быть обычной ролью без дополнительных прав.')
+        if not guild.me.guild_permissions.manage_roles or role >= guild.me.top_role:
+            raise rules.GameError('Бот не может управлять ролью участников мафии. Проверьте его права и иерархию.')
+        if state.get('participant_role_id') != role.id:
+            game = await self.patch_state(game['id'], participant_role_id=role.id)
+            state = game['state']
+        families = await family_role_ids(self.bot, GUILD_ID)
+        candidates = set(state['players']) | set(state.get('participant_role_members', []))
+        candidates.update(str(member.id) for member in role.members)
+        assigned = []
+        for uid in sorted(candidates):
+            try:
+                member = await guild.fetch_member(int(uid))
+            except disnake.NotFound:
+                continue
+            wanted = uid in state['players'] and not member.bot and bool({r.id for r in member.roles} & families)
+            has_role = role.id in {r.id for r in member.roles}
+            if wanted != has_role:
+                if member.id == guild.owner_id or member.top_role >= guild.me.top_role:
+                    raise rules.GameError(f'{member.mention}: для выдачи или снятия роли участника роль бота должна быть выше роли игрока.')
+                change = member.add_roles if wanted else member.remove_roles
+                await change(role, reason=f"Мафия #{game['id']}: синхронизация участников", atomic=True)
+            if wanted:
+                assigned.append(uid)
+        if state.get('participant_role_members') != assigned:
+            game = await self.patch_state(game['id'], participant_role_members=assigned)
+        return game
+
     async def preflight_start(self, game: dict) -> None:
-        if game['state']['phase'] != 'lobby':
-            raise rules.GameError('Игра уже началась.')
-        if not 6 <= len(game['state']['players']) <= 12:
-            raise rules.GameError('Для старта нужно от 6 до 12 игроков.')
+        rules.validate_start(game['state'])
         guild = self.bot.get_guild(GUILD_ID)
         families = await family_role_ids(self.bot, GUILD_ID)
         for uid in game['state']['players']:
@@ -269,6 +321,8 @@ class MafiaRooms:
         events = await self.bot.database.get_mafia_events(game['id'])
         if not events:
             return
+        game = await self.sync_participant_role(game)
+        role_id = game['state'].get('participant_role_id')
         channel_id = game['state'].get('rooms', {}).get('events', game['channel_id'])
         channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
         if not isinstance(channel, disnake.TextChannel) or channel.guild.id != GUILD_ID:
@@ -289,6 +343,84 @@ class MafiaRooms:
                     text += '\n**' + {'town': 'Победил город!', 'mafia': 'Победила мафия!', 'draw': 'Ничья!'}[event['winner']] + '**'
                 embed = disnake.Embed(title=f"{rules.PHASES[event['phase']]} · Раунд {event['round']}", description=text, color=disnake.Color.dark_purple())
                 embed.set_footer(text=marker)
-                message = await channel.send(embed=embed, allowed_mentions=disnake.AllowedMentions.none())
+                message = await channel.send(
+                    content=f'<@&{role_id}>' if role_id else None,
+                    embed=embed,
+                    allowed_mentions=disnake.AllowedMentions(
+                        everyone=False, users=False, roles=[disnake.Object(role_id)] if role_id else False,
+                        replied_user=False,
+                    ),
+                )
                 message_id = message.id
             await self.bot.database.mark_mafia_event_sent(row['id'], message_id)
+
+    async def delete_game_rooms(self, game: dict) -> bool:
+        state = game['state']
+        if state['phase'] in rules.ACTIVE_PHASES:
+            return False
+        if state.get('rooms_deleted'):
+            return True
+        if state.get('cleanup_at') is None or disnake.utils.utcnow().timestamp() < state['cleanup_at']:
+            return False
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None:
+            return False
+        channels = await guild.fetch_channels()
+        by_id = {channel.id: channel for channel in channels}
+        rooms = state.get('rooms', {})
+        category = by_id.get(rooms.get('category'))
+        if category is None and state.get('room_key'):
+            name = f"Мафия #{game['id']} · {state['room_key']}"
+            category = next((channel for channel in channels
+                             if isinstance(channel, disnake.CategoryChannel) and channel.name == name), None)
+        if category is not None and not isinstance(category, disnake.CategoryChannel):
+            raise rules.GameError('Сохранённая категория игры имеет неверный тип.')
+        targets = []
+        for kind, name in ROOM_NAMES.items():
+            channel = by_id.get(rooms.get(kind))
+            if channel is None and category is not None:
+                # Recover a room created before a crash but not yet saved in the DB.
+                channel = next((c for c in channels if getattr(c, 'category_id', None) == category.id and c.name == name), None)
+            expected = disnake.VoiceChannel if kind in VOICE_ROOMS else disnake.TextChannel
+            if channel is not None:
+                if not isinstance(channel, expected):
+                    raise rules.GameError(f'Сохранённая комната «{name}» имеет неверный тип.')
+                targets.append(channel)
+        failed = False
+        for channel in targets:
+            try:
+                await channel.delete(reason=f"Мафия #{game['id']}: партия завершена, удаление комнаты")
+            except disnake.NotFound:
+                pass
+            except disnake.DiscordException:
+                failed = True
+                logging.exception('Could not delete mafia room %s for game %s', channel.id, game['id'])
+        # Delete the category last; failed children remain discoverable for a retry.
+        if failed:
+            return False
+        role_id = state.get('participant_role_id')
+        if role_id is not None or state.get('room_key'):
+            roles = await guild.fetch_roles()
+            role = next((r for r in roles if r.id == role_id), None)
+            if role is None and state.get('room_key'):
+                role = next((r for r in roles if r.name == self.participant_role_name(game)), None)
+            if role is not None:
+                if role.is_default() or role.managed:
+                    raise rules.GameError('Сохранённая роль участников не может быть удалена ботом.')
+                try:
+                    await role.delete(reason=f"Мафия #{game['id']}: удаление роли участников")
+                except disnake.NotFound:
+                    pass
+                except disnake.DiscordException:
+                    logging.exception('Could not delete mafia participant role for game %s', game['id'])
+                    return False
+        if category is not None:
+            try:
+                await category.delete(reason=f"Мафия #{game['id']}: удаление категории завершённой партии")
+            except disnake.NotFound:
+                pass
+            except disnake.DiscordException:
+                logging.exception('Could not delete mafia category for game %s', game['id'])
+                return False
+        await self.patch_state(game['id'], rooms_deleted=True)
+        return True

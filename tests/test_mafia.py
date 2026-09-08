@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import disnake
 from access_control import command_access_level
 from cogs import mafia_game as rules
-from cogs.mafia import game_embed, private_panel, MafiaCog
+from cogs.mafia import game_buttons, game_embed, private_panel, MafiaCog
 from config import GUILD_ID
 
 
@@ -22,6 +22,56 @@ def playing():
 
 
 class RulesTests(unittest.TestCase):
+    def test_start_requires_five_and_every_confirmation_before_revealing_roles(self):
+        state = rules.new_game(1)
+        for uid in range(1, 5):
+            rules.join(state, uid, str(uid))
+        with self.assertRaises(rules.GameError):
+            rules.request_start(state)
+        rules.join(state, 5, '5')
+        rules.request_start(state)
+        token = state['token']
+        self.assertIsNone(state['deadline'])
+        self.assertFalse(rules.advance(state, 999999))
+        for uid in range(1, 5):
+            self.assertFalse(rules.confirm_start(state, uid, token))
+        self.assertFalse(rules.confirm_start(state, 1, token))
+        self.assertEqual(len(state['confirmations']), 4)
+        self.assertTrue(all(p['role'] is None for p in state['players'].values()))
+        with self.assertRaises(rules.GameError):
+            rules.start(state, 100)
+        with self.assertRaises(rules.GameError):
+            rules.confirm_start(state, 99, token)
+        with self.assertRaises(rules.GameError):
+            rules.join(state, 6, '6')
+        state = copy.deepcopy(state)  # persisted readiness survives reconstruction
+        self.assertTrue(rules.confirm_start(state, 5, token))
+        rules.start(state, 100)
+        self.assertEqual(state['phase'], 'night')
+        self.assertEqual(sum(p['role'] == 'mafia' for p in state['players'].values()), 1)
+        with self.assertRaises(rules.GameError):
+            rules.confirm_start(state, 5, token)
+
+    def test_departure_resets_readiness_and_old_buttons(self):
+        for remove in (rules.leave, rules.depart):
+            state = rules.new_game(1)
+            for uid in range(1, 7):
+                rules.join(state, uid, str(uid))
+            rules.request_start(state)
+            token = state['token']
+            rules.confirm_start(state, 1, token)
+            remove(state, 6)
+            self.assertFalse(state['confirmation_pending'])
+            self.assertEqual(state['confirmations'], [])
+            rules.request_start(state)
+            with self.assertRaises(rules.GameError):
+                rules.confirm_start(state, 1, token)
+            buttons = game_buttons({'id': 1, 'state': state})
+            self.assertEqual(buttons[0].custom_id, f"mafia:confirm_start:1:{state['token']}")
+            self.assertNotIn('mafia:start:1', [b.custom_id for b in buttons])
+            rules.cancel(state)
+            self.assertFalse(state['confirmation_pending'])
+
     def test_lobby_capacity_and_duplicate(self):
         state = rules.new_game(1)
         with self.assertRaises(rules.GameError):
@@ -37,13 +87,13 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(len(state['players']), 12)
 
     def test_role_distribution_all_sizes(self):
-        for count in range(6, 13):
+        for count in range(5, 13):
             state = rules.new_game(1)
             for uid in range(count):
                 rules.join(state, uid, str(uid))
             rules.start(state, 0)
             roles = [p['role'] for p in state['players'].values()]
-            self.assertEqual(roles.count('mafia'), 2 if count <= 8 else 3)
+            self.assertEqual(roles.count('mafia'), 1 if count == 5 else (2 if count <= 8 else 3))
             self.assertEqual(roles.count('doctor'), 1)
             self.assertEqual(roles.count('commissioner'), 1)
             with self.assertRaises(rules.GameError):
@@ -180,18 +230,70 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
             cog.bot = SimpleNamespace()
             cog._game_locks = WeakValueDictionary()
             cog.advance_game = AsyncMock()
+            cog.maintain_game = AsyncMock()
+            cog.sync_message = AsyncMock()
             member = Mock(spec=disnake.Member)
             member.bot = False
             inter = SimpleNamespace(
                 guild_id=GUILD_ID, author=member,
                 component=SimpleNamespace(custom_id=f'mafia:{action}:1'),
-                response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock(),
+                id=1, token='test-interaction', _session=None,
+                type=disnake.InteractionType.component,
+                edit_original_response=AsyncMock(),
             )
-            with patch('cogs.mafia.member_access_level', AsyncMock(return_value=level)), patch('cogs.mafia.has_family_role', AsyncMock(return_value=False)):
-                await cog.handle_component(inter)
+            inter.response = disnake.InteractionResponse(inter)
+            adapter = SimpleNamespace(create_interaction_response=AsyncMock())
+            context = disnake.InteractionResponse.defer.__globals__['async_context']
+            context_token = context.set(adapter)
+            try:
+                with patch('cogs.mafia.member_access_level', AsyncMock(return_value=level)), patch('cogs.mafia.has_family_role', AsyncMock(return_value=False)):
+                    await cog.handle_component(inter)
+            finally:
+                context.reset(context_token)
+            response = adapter.create_interaction_response.call_args.kwargs
+            self.assertEqual(response['type'], disnake.InteractionResponseType.deferred_channel_message.value)
+            self.assertEqual(response['data']['flags'], disnake.MessageFlags.ephemeral.flag)
             cog.advance_game.assert_not_awaited()
+            cog.maintain_game.assert_not_awaited()
+            cog.sync_message.assert_not_awaited()
             expected = 'семейной ролью' if action == 'join' else 'уровня допуска'
             self.assertIn(expected, inter.edit_original_response.call_args.args[0])
+
+    async def test_component_reply_mode_is_private_for_role_and_action_menus(self):
+        for custom_id in ('mafia:role:1', 'mafia:act:1:2', 'mafia:join:1', 'mafia:start:1'):
+            cog = object.__new__(MafiaCog)
+            cog._game_locks = WeakValueDictionary()
+            cog._handle_component = AsyncMock()
+            inter = SimpleNamespace(
+                guild_id=GUILD_ID, author=Mock(spec=disnake.Member),
+                component=SimpleNamespace(custom_id=custom_id),
+                response=SimpleNamespace(defer=AsyncMock()),
+            )
+            await cog.handle_component(inter)
+            inter.response.defer.assert_awaited_once_with(with_message=True, ephemeral=True)
+            cog._handle_component.assert_awaited_once_with(inter)
+
+    async def test_panel_repair_restores_lobby_buttons_and_clears_error_text(self):
+        state = rules.new_game(1)
+        rules.join(state, 1, 'Player')
+        game = {'id': 1, 'state': state, 'channel_id': 123, 'message_id': 456,
+                'revision': 5, 'message_revision': 5}
+        message = SimpleNamespace(id=456, edit=AsyncMock())
+        channel = Mock(spec=disnake.TextChannel)
+        channel.guild = SimpleNamespace(id=GUILD_ID)
+        channel.fetch_message = AsyncMock(return_value=message)
+        db = SimpleNamespace(get_mafia_game=AsyncMock(return_value=game),
+                             set_mafia_message=AsyncMock(), pending_mafia_games=AsyncMock(return_value=[{'id': 1}]))
+        cog = object.__new__(MafiaCog)
+        cog.bot = SimpleNamespace(database=db, get_channel=lambda _: channel)
+        cog._game_locks, cog._message_locks = WeakValueDictionary(), WeakValueDictionary()
+        await cog.restore_mafia_panels()
+        kwargs = message.edit.call_args.kwargs
+        self.assertIsNone(kwargs['content'])
+        self.assertEqual([button.custom_id for button in kwargs['components']],
+                         ['mafia:join:1', 'mafia:leave:1', 'mafia:start:1', 'mafia:stop:1'])
+        self.assertEqual(state['phase'], 'lobby')
+        db.set_mafia_message.assert_awaited_once_with(1, 456, 5)
 
 
 if __name__ == '__main__':

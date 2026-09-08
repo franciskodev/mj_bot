@@ -23,12 +23,12 @@ def new_game(host_id: int, voice_id: int | None = None) -> dict:
         "phase": "lobby", "host_id": host_id, "voice_id": voice_id,
         "players": {}, "round": 0, "token": 0, "deadline": None,
         "paused": False, "remaining": None, "actions": {}, "votes": {},
-        "winner": None, "event": "Набор открыт. Для старта нужно 6–12 игроков.",
+        "winner": None, "event": f"Набор открыт. Для старта нужно {MAFIA_MIN_PLAYERS}–{MAFIA_MAX_PLAYERS} игроков.",
     }
 
 
 def join(state: dict, user_id: int, name: str) -> None:
-    if state["phase"] != "lobby":
+    if state["phase"] != "lobby" or state.get('confirmation_pending'):
         raise GameError("Набор уже закрыт.")
     key = str(user_id)
     if key in state["players"]:
@@ -44,6 +44,7 @@ def leave(state: dict, user_id: int) -> None:
         raise GameError("Покинуть лобби можно только до начала игры.")
     if state["players"].pop(str(user_id), None) is None:
         raise GameError("Вы не участвуете в этой игре.")
+    reset_confirmation(state)
     state["event"] = f"<@{user_id}> вышел из лобби."
 
 
@@ -55,13 +56,48 @@ def enter_phase(state: dict, phase: str, now: float) -> None:
     state["deadline"] = now + DURATIONS[phase]
 
 
-def start(state: dict, now: float) -> None:
+def validate_start(state: dict) -> None:
     if state["phase"] != "lobby":
         raise GameError("Игра уже началась.")
     count = len(state["players"])
     if not MAFIA_MIN_PLAYERS <= count <= MAFIA_MAX_PLAYERS:
-        raise GameError("Для старта нужно от 6 до 12 игроков.")
-    mafia_count = 2 if count <= 8 else 3
+        raise GameError(f"Для старта нужно от {MAFIA_MIN_PLAYERS} до {MAFIA_MAX_PLAYERS} игроков.")
+
+
+def request_start(state: dict) -> None:
+    validate_start(state)
+    if state.get('confirmation_pending'):
+        raise GameError('Ожидается подтверждение участников.')
+    state.update(confirmation_pending=True, confirmations=[], deadline=None,
+                 event='Запуск объявлен. Всем игрокам нужно нажать «Подтверждаю участие» в ЛС или на панели игры.')
+    state['token'] += 1
+
+
+def reset_confirmation(state: dict) -> None:
+    if state.get('confirmation_pending'):
+        state.update(confirmation_pending=False, confirmations=[])
+        state['token'] += 1
+
+
+def confirm_start(state: dict, user_id: int, token: int) -> bool:
+    if state['phase'] != 'lobby' or not state.get('confirmation_pending') or token != state['token']:
+        raise GameError('Это подтверждение устарело. Откройте текущую панель игры.')
+    key = str(user_id)
+    if key not in state['players']:
+        raise GameError('Подтвердить участие могут только игроки этой партии.')
+    if key not in state['confirmations']:
+        state['confirmations'].append(key)
+        state['event'] = f"Участие подтвердили {len(state['confirmations'])} из {len(state['players'])} игроков."
+    return set(state['confirmations']) == set(state['players'])
+
+
+def start(state: dict, now: float) -> None:
+    validate_start(state)
+    if state.get('confirmation_pending') and set(state['confirmations']) != set(state['players']):
+        raise GameError('Сначала все игроки должны подтвердить участие.')
+    state['confirmation_pending'] = False
+    count = len(state['players'])
+    mafia_count = 1 if count == 5 else (2 if count <= 8 else 3)
     roles = ["mafia"] * mafia_count + ["doctor", "commissioner"] + ["civilian"] * (count - mafia_count - 2)
     secrets.SystemRandom().shuffle(roles)
     for player, role in zip(state["players"].values(), roles):
@@ -201,7 +237,7 @@ def cancel(state: dict) -> None:
     if state["phase"] not in ACTIVE_PHASES:
         raise GameError("Игра уже завершена.")
     state.update(phase="cancelled", deadline=None, paused=False, remaining=None,
-                 setup_pending=False, room_error=False,
+                 setup_pending=False, room_error=False, confirmation_pending=False,
                  event="Игра отменена. Результат не учитывается в статистике.")
     state["token"] += 1
 
@@ -214,6 +250,7 @@ def depart(state: dict, user_id: int) -> None:
         return
     if state["phase"] == "lobby":
         del state["players"][key]
+        reset_confirmation(state)
         state["event"] = f"<@{user_id}> исключён из лобби: недоступен или потерял семейную роль."
         return
     if not player["alive"]:

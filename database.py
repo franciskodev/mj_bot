@@ -8,12 +8,15 @@ from time import monotonic
 import asyncpg
 import disnake
 
+from cogs.mafia_notifications import personal_events
+
 from config import (
     APPLICATION_COOLDOWN_DAYS,
     DATABASE_URL,
     FAMILY_MEMBER_ROLE_ID,
     FAMILY_NAME,
     GUILD_ID,
+    MAFIA_CLEANUP_DELAY_SECONDS,
     SERVER_ROLE_IDS,
     TARGET_ROLE_IDS,
 )
@@ -441,6 +444,18 @@ class Database:
                     payload JSONB NOT NULL,
                     message_id BIGINT
                 );
+                CREATE TABLE IF NOT EXISTS mafia_notifications (
+                    id BIGSERIAL PRIMARY KEY,
+                    game_id BIGINT NOT NULL REFERENCES mafia_games(id),
+                    discord_id BIGINT NOT NULL,
+                    payload JSONB NOT NULL,
+                    message_id BIGINT,
+                    processed_at TIMESTAMPTZ,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS mafia_notifications_pending_idx
+                    ON mafia_notifications(next_attempt_at, id) WHERE processed_at IS NULL;
 
                 CREATE TABLE IF NOT EXISTS giveaways (
                     id BIGSERIAL PRIMARY KEY,
@@ -2322,6 +2337,10 @@ class Database:
                 if json.dumps(state, sort_keys=True) == original:
                     return
                 active = state["phase"] not in {"finished", "cancelled"}
+                if not active and row['active'] and (
+                    state.get('rooms_enabled') or state.get('room_key') or state.get('rooms')
+                ):
+                    state['cleanup_at'] = datetime.now(timezone.utc).timestamp() + MAFIA_CLEANUP_DELAY_SECONDS
                 channel_id = state.get("rooms", {}).get("events", game["channel_id"])
                 await connection.execute(
                     """UPDATE mafia_games SET state=$2::JSONB,active=$3,
@@ -2336,6 +2355,11 @@ class Database:
                     await connection.execute(
                         "INSERT INTO mafia_events(game_id,payload) VALUES($1,$2::JSONB)",
                         game_id, json.dumps(public),
+                    )
+                for event in personal_events(json.loads(original), state):
+                    await connection.execute(
+                        'INSERT INTO mafia_notifications(game_id,discord_id,payload) VALUES($1,$2,$3::JSONB)',
+                        game_id, event['user_id'], json.dumps(event),
                     )
                 if state["phase"] == "finished":
                     for uid, player in state["players"].items():
@@ -2355,9 +2379,11 @@ class Database:
             raise RuntimeError("Database is not connected")
         return await self.pool.fetch(
             """SELECT id FROM mafia_games WHERE guild_id=$1
-            AND (active=TRUE OR message_revision<revision
+            AND (active=TRUE
                 OR EXISTS(SELECT 1 FROM mafia_role_holds h WHERE h.game_id=mafia_games.id AND h.restored_at IS NULL)
-                OR EXISTS(SELECT 1 FROM mafia_events e WHERE e.game_id=mafia_games.id AND e.message_id IS NULL))
+                OR (NOT COALESCE((state->>'rooms_deleted')::BOOLEAN,FALSE) AND (
+                    message_revision<revision OR state ? 'cleanup_at'
+                    OR EXISTS(SELECT 1 FROM mafia_events e WHERE e.game_id=mafia_games.id AND e.message_id IS NULL))))
             ORDER BY id""", guild_id,
         )
 
@@ -2468,3 +2494,30 @@ class Database:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
         await self.pool.execute("UPDATE mafia_events SET message_id=$2 WHERE id=$1", event_id, message_id)
+
+    async def get_mafia_notifications(self, guild_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            raise RuntimeError('Database is not connected')
+        return await self.pool.fetch(
+            '''SELECT n.* FROM mafia_notifications n JOIN mafia_games g ON g.id=n.game_id
+            WHERE g.guild_id=$1 AND n.processed_at IS NULL AND n.next_attempt_at<=NOW()
+            ORDER BY n.id LIMIT 100''', guild_id,
+        )
+
+    async def finish_mafia_notification(self, notification_id: int, message_id: int | None = None) -> None:
+        if self.pool is None:
+            raise RuntimeError('Database is not connected')
+        await self.pool.execute(
+            'UPDATE mafia_notifications SET processed_at=NOW(),message_id=$2 WHERE id=$1',
+            notification_id, message_id,
+        )
+
+    async def retry_mafia_notification(self, notification_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError('Database is not connected')
+        await self.pool.execute(
+            """UPDATE mafia_notifications SET attempts=attempts+1,
+            next_attempt_at=NOW()+INTERVAL '30 seconds',
+            processed_at=CASE WHEN attempts>=2 THEN NOW() ELSE NULL END WHERE id=$1""",
+            notification_id,
+        )
