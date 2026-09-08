@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import disnake
 
-from config import DEVELOPER_USER_ID, GUILD_ID, TARGET_ROLE_IDS
+from config import DEVELOPER_USER_ID, FAMILY_MEMBER_ROLE_ID, GUILD_ID, TARGET_ROLE_IDS
 
 if TYPE_CHECKING:
     from bot import IntoleranceBot
@@ -23,6 +23,10 @@ ACCESS_LEVEL_NAMES = {
 # Эти значения используются, пока администратор не задаст переопределение
 # командой /access command. Неизвестная новая команда безопасно получает уровень 5.
 DEFAULT_COMMAND_LEVELS = {
+    "mafia create": 5,
+    "mafia status": 1,
+    "mafia top": 1,
+    "mafia stats": 1,
     "help": 1,
     "ping": 1,
     "myinfo": 1,
@@ -47,6 +51,8 @@ DEFAULT_COMMAND_LEVELS = {
     "giveaway reroll": 5,
     "giveaway cancel": 5,
     "applications setup": 5,
+    "applications block": 5,
+    "applications unblock": 5,
     "blacklist add": 5,
     "access command": 5,
     "access role_add": 5,
@@ -61,6 +67,9 @@ DEFAULT_COMMAND_LEVELS = {
 
 # Эти команды нельзя ослабить пользовательской настройкой.
 PROTECTED_COMMAND_LEVELS = {
+    "mafia create": 5,
+    "applications block": 5,
+    "applications unblock": 5,
     "режим_проверки": 4,
     "blacklist add": 5,
     "giveaway end": 5,
@@ -113,6 +122,7 @@ async def member_access_level(
     level = await bot.database.get_highest_role_access_level(
         member.guild.id, role_ids
     )
+    level = max(level, await bot.database.get_mafia_saved_access(member.guild.id, member.id))
 
     departments = await bot.database.get_department_configs(member.guild.id)
     for department in departments:
@@ -129,9 +139,22 @@ async def member_access_level(
             row["role_id"] for row in await bot.database.get_families(member.guild.id)
             if row["role_id"] is not None
         }
-        if role_ids.intersection(family_roles):
+        if role_ids.intersection(family_roles | {FAMILY_MEMBER_ROLE_ID}):
             level = max(level, 1)
         if role_ids.intersection(TARGET_ROLE_IDS):
             level = max(level, 1)
 
     return level
+
+
+async def family_role_ids(bot: "IntoleranceBot", guild_id: int) -> set[int]:
+    if guild_id != GUILD_ID:
+        return set()
+    return {FAMILY_MEMBER_ROLE_ID, *TARGET_ROLE_IDS} | {
+        row["role_id"] for row in await bot.database.get_families(guild_id)
+        if row["role_id"] is not None
+    }
+
+
+async def has_family_role(bot: "IntoleranceBot", member: disnake.Member) -> bool:
+    return bool({role.id for role in member.roles} & await family_role_ids(bot, member.guild.id))

@@ -11,16 +11,17 @@ async def send_admin_log(
     title: str,
     description: str,
     color: disnake.Color = disnake.Color.blurple(),
+    channel_id: int = ADMIN_LOG_CHANNEL_ID,
 ) -> None:
-    channel = bot.get_channel(ADMIN_LOG_CHANNEL_ID)
+    channel = bot.get_channel(channel_id)
     if channel is None:
         try:
-            channel = await bot.fetch_channel(ADMIN_LOG_CHANNEL_ID)
+            channel = await bot.fetch_channel(channel_id)
         except disnake.DiscordException:
-            logging.exception("Could not fetch admin log channel")
+            logging.exception("Could not fetch log channel %s", channel_id)
             return
     if not isinstance(channel, (disnake.TextChannel, disnake.Thread)):
-        logging.error("Admin log channel %s is not a text channel", ADMIN_LOG_CHANNEL_ID)
+        logging.error("Log channel %s is not a text channel", channel_id)
         return
     embed = disnake.Embed(
         title=title, description=description, color=color, timestamp=disnake.utils.utcnow()
@@ -29,4 +30,4 @@ async def send_admin_log(
     try:
         await channel.send(embed=embed)
     except disnake.DiscordException:
-        logging.exception("Could not send admin log")
+        logging.exception("Could not send log to channel %s", channel_id)

@@ -1,12 +1,15 @@
 import asyncio
+from contextlib import asynccontextmanager
+import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import monotonic
 
 import asyncpg
 import disnake
 
 from config import (
+    APPLICATION_COOLDOWN_DAYS,
     DATABASE_URL,
     FAMILY_MEMBER_ROLE_ID,
     FAMILY_NAME,
@@ -328,6 +331,15 @@ class Database:
                 CREATE INDEX IF NOT EXISTS applications_user_created_idx
                     ON applications(discord_id, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS application_blocks (
+                    guild_id BIGINT NOT NULL,
+                    discord_id BIGINT NOT NULL,
+                    reason TEXT NOT NULL,
+                    blocked_by BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, discord_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS application_guild_config (
                     guild_id BIGINT PRIMARY KEY,
                     panel_channel_id BIGINT NOT NULL,
@@ -382,6 +394,53 @@ class Database:
                     ON family_blacklist USING GIN(static_ids) WHERE active=TRUE;
                 CREATE INDEX IF NOT EXISTS family_blacklist_active_message_idx
                     ON family_blacklist(channel_message_id) WHERE active=TRUE;
+
+                CREATE TABLE IF NOT EXISTS mafia_games (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    message_id BIGINT,
+                    state JSONB NOT NULL,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    message_revision INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS mafia_one_active_guild_idx
+                    ON mafia_games(guild_id) WHERE active=TRUE;
+                CREATE TABLE IF NOT EXISTS mafia_results (
+                    game_id BIGINT NOT NULL REFERENCES mafia_games(id),
+                    guild_id BIGINT NOT NULL,
+                    discord_id BIGINT NOT NULL,
+                    role TEXT NOT NULL,
+                    won BOOLEAN NOT NULL,
+                    survived BOOLEAN NOT NULL,
+                    points INTEGER NOT NULL,
+                    finished_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY(game_id,discord_id)
+                );
+                CREATE INDEX IF NOT EXISTS mafia_results_guild_user_idx
+                    ON mafia_results(guild_id,discord_id);
+                CREATE TABLE IF NOT EXISTS mafia_role_holds (
+                    game_id BIGINT NOT NULL REFERENCES mafia_games(id),
+                    guild_id BIGINT NOT NULL,
+                    discord_id BIGINT NOT NULL,
+                    role_ids BIGINT[] NOT NULL,
+                    access_level SMALLINT NOT NULL CHECK(access_level BETWEEN 0 AND 6),
+                    restored_at TIMESTAMPTZ,
+                    PRIMARY KEY(game_id,discord_id)
+                );
+                ALTER TABLE mafia_role_holds
+                    DROP CONSTRAINT IF EXISTS mafia_role_holds_access_level_check;
+                ALTER TABLE mafia_role_holds
+                    ADD CONSTRAINT mafia_role_holds_access_level_check
+                    CHECK(access_level BETWEEN 0 AND 6);
+                CREATE TABLE IF NOT EXISTS mafia_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    game_id BIGINT NOT NULL REFERENCES mafia_games(id),
+                    payload JSONB NOT NULL,
+                    message_id BIGINT
+                );
 
                 CREATE TABLE IF NOT EXISTS giveaways (
                     id BIGSERIAL PRIMARY KEY,
@@ -1395,6 +1454,51 @@ class Database:
             "SELECT * FROM application_guild_config WHERE guild_id=$1", guild_id
         )
 
+    async def is_application_blocked(self, guild_id: int, discord_id: int) -> bool:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return bool(await self.pool.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM application_blocks
+            WHERE guild_id=$1 AND discord_id=$2)""",
+            guild_id, discord_id,
+        ))
+
+    async def block_applications(
+        self, guild_id: int, discord_id: int, reason: str, blocked_by: int
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO application_blocks(guild_id,discord_id,reason,blocked_by)
+            VALUES($1,$2,$3,$4) ON CONFLICT(guild_id,discord_id) DO UPDATE SET
+                reason=EXCLUDED.reason,blocked_by=EXCLUDED.blocked_by,
+                created_at=NOW()""",
+            guild_id, discord_id, reason, blocked_by,
+        )
+
+    async def unblock_applications(self, guild_id: int, discord_id: int) -> bool:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        result = await self.pool.execute(
+            "DELETE FROM application_blocks WHERE guild_id=$1 AND discord_id=$2",
+            guild_id, discord_id,
+        )
+        return result != "DELETE 0"
+
+    async def get_application_cooldown_until(
+        self, guild_id: int, discord_id: int
+    ) -> datetime | None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        created_at = await self.pool.fetchval(
+            """SELECT MAX(created_at) FROM applications
+            WHERE guild_id=$1 AND discord_id=$2""",
+            guild_id, discord_id,
+        )
+        if created_at is None:
+            return None
+        return created_at + timedelta(days=APPLICATION_COOLDOWN_DAYS)
+
     async def has_open_application(self, discord_id: int, guild_id: int) -> bool:
         if self.pool is None:
             return False
@@ -2171,3 +2275,196 @@ class Database:
             "SELECT * FROM department_config WHERE guild_id=$1 ORDER BY department",
             guild_id,
         )
+
+    async def create_mafia_game(self, guild_id: int, channel_id: int, state: dict) -> int:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetchval(
+            """INSERT INTO mafia_games(guild_id,channel_id,state)
+            VALUES($1,$2,$3::JSONB) RETURNING id""",
+            guild_id, channel_id, json.dumps(state),
+        )
+
+    async def get_mafia_game(self, guild_id: int, game_id: int | None = None) -> dict | None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        row = await self.pool.fetchrow(
+            """SELECT * FROM mafia_games WHERE guild_id=$1
+            AND (($2::BIGINT IS NULL AND active=TRUE) OR id=$2)
+            ORDER BY id DESC LIMIT 1""", guild_id, game_id,
+        )
+        if row is None:
+            return None
+        result = dict(row)
+        result["state"] = json.loads(result["state"])
+        return result
+
+    @asynccontextmanager
+    async def mafia_transaction(self, guild_id: int, game_id: int):
+        """Serialize actions/timers and commit state with final results atomically."""
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    "SELECT * FROM mafia_games WHERE guild_id=$1 AND id=$2 FOR UPDATE",
+                    guild_id, game_id,
+                )
+                if row is None:
+                    yield None
+                    return
+                game = dict(row)
+                game["state"] = json.loads(game["state"])
+                original = json.dumps(game["state"], sort_keys=True)
+                old_public = self.mafia_public_state(game["state"])
+                yield game
+                state = game["state"]
+                if json.dumps(state, sort_keys=True) == original:
+                    return
+                active = state["phase"] not in {"finished", "cancelled"}
+                channel_id = state.get("rooms", {}).get("events", game["channel_id"])
+                await connection.execute(
+                    """UPDATE mafia_games SET state=$2::JSONB,active=$3,
+                    revision=revision+1,
+                    message_id=CASE WHEN channel_id<>$4 THEN NULL ELSE message_id END,
+                    message_revision=CASE WHEN channel_id<>$4 THEN 0 ELSE message_revision END,
+                    channel_id=$4 WHERE id=$1""",
+                    game_id, json.dumps(state), active, channel_id,
+                )
+                public = self.mafia_public_state(state)
+                if public != old_public:
+                    await connection.execute(
+                        "INSERT INTO mafia_events(game_id,payload) VALUES($1,$2::JSONB)",
+                        game_id, json.dumps(public),
+                    )
+                if state["phase"] == "finished":
+                    for uid, player in state["players"].items():
+                        team = "mafia" if player["role"] == "mafia" else "town"
+                        won = team == state["winner"]
+                        await connection.execute(
+                            """INSERT INTO mafia_results(
+                                game_id,guild_id,discord_id,role,won,survived,points
+                            ) VALUES($1,$2,$3,$4,$5,$6,$7)
+                            ON CONFLICT(game_id,discord_id) DO NOTHING""",
+                            game_id, guild_id, int(uid), player["role"], won,
+                            player["alive"], 3 if won else 1,
+                        )
+
+    async def pending_mafia_games(self, guild_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetch(
+            """SELECT id FROM mafia_games WHERE guild_id=$1
+            AND (active=TRUE OR message_revision<revision
+                OR EXISTS(SELECT 1 FROM mafia_role_holds h WHERE h.game_id=mafia_games.id AND h.restored_at IS NULL)
+                OR EXISTS(SELECT 1 FROM mafia_events e WHERE e.game_id=mafia_games.id AND e.message_id IS NULL))
+            ORDER BY id""", guild_id,
+        )
+
+    async def set_mafia_message(self, game_id: int, message_id: int, revision: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            "UPDATE mafia_games SET message_id=$2,message_revision=$3 WHERE id=$1",
+            game_id, message_id, revision,
+        )
+
+    async def mafia_leaderboard(
+        self, guild_id: int, metric: str = "points", days: int = 0,
+        user_id: int | None = None,
+    ) -> list[asyncpg.Record]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        orders = {
+            "points": "points DESC,wins DESC,games DESC",
+            "wins": "wins DESC,win_rate DESC,games DESC",
+            "games": "games DESC,wins DESC,points DESC",
+            "win_rate": "win_rate DESC,wins DESC,games DESC",
+            "mafia_wins": "mafia_wins DESC,wins DESC,games DESC",
+            "town_wins": "town_wins DESC,wins DESC,games DESC",
+            "survived": "survived DESC,wins DESC,games DESC",
+        }
+        if metric not in orders or days not in {0, 7, 30}:
+            raise ValueError("Invalid leaderboard filter")
+        minimum = 5 if metric == "win_rate" else 1
+        return await self.pool.fetch(
+            f"""SELECT discord_id,COUNT(*) AS games,
+            COUNT(*) FILTER(WHERE won) AS wins,
+            COUNT(*) FILTER(WHERE won AND role='mafia') AS mafia_wins,
+            COUNT(*) FILTER(WHERE won AND role<>'mafia') AS town_wins,
+            COUNT(*) FILTER(WHERE survived) AS survived,
+            SUM(points) AS points,
+            ROUND(100.0*COUNT(*) FILTER(WHERE won)/COUNT(*),1) AS win_rate
+            FROM mafia_results WHERE guild_id=$1
+            AND ($2::INTEGER=0 OR finished_at>=NOW()-($2*INTERVAL '1 day'))
+            AND ($3::BIGINT IS NULL OR discord_id=$3)
+            GROUP BY discord_id HAVING COUNT(*) >= $4
+            ORDER BY {orders[metric]},discord_id LIMIT 10""",
+            guild_id, days, user_id, minimum,
+        )
+
+    @staticmethod
+    def mafia_public_state(state: dict) -> dict:
+        return {key: state[key] for key in ('phase', 'round', 'event', 'paused', 'winner')}
+
+    async def get_mafia_saved_access(self, guild_id: int, discord_id: int) -> int:
+        if self.pool is None:
+            return 0
+        return await self.pool.fetchval(
+            """SELECT COALESCE(MAX(access_level),0) FROM mafia_role_holds
+            WHERE guild_id=$1 AND discord_id=$2 AND restored_at IS NULL""",
+            guild_id, discord_id,
+        )
+
+    async def hold_mafia_roles(self, game_id: int, guild_id: int, discord_id: int,
+                               role_ids: list[int], access_level: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO mafia_role_holds(game_id,guild_id,discord_id,role_ids,access_level)
+            VALUES($1,$2,$3,$4,$5) ON CONFLICT(game_id,discord_id) DO UPDATE SET
+            role_ids=ARRAY(SELECT DISTINCT unnest(mafia_role_holds.role_ids || EXCLUDED.role_ids)),
+            access_level=GREATEST(mafia_role_holds.access_level,EXCLUDED.access_level),restored_at=NULL""",
+            game_id, guild_id, discord_id, role_ids, access_level,
+        )
+
+    async def get_mafia_role_holds(self, game_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetch(
+            "SELECT * FROM mafia_role_holds WHERE game_id=$1 AND restored_at IS NULL", game_id,
+        )
+
+    async def finish_mafia_role_hold(self, game_id: int, discord_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                result = await connection.execute(
+                    """UPDATE mafia_role_holds SET restored_at=NOW()
+                    WHERE game_id=$1 AND discord_id=$2 AND restored_at IS NULL""",
+                    game_id, discord_id,
+                )
+                if result != 'UPDATE 0':
+                    await connection.execute('UPDATE mafia_games SET revision=revision+1 WHERE id=$1', game_id)
+
+    async def has_other_mafia_role_hold(self, guild_id: int, discord_id: int, game_id: int) -> bool:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM mafia_role_holds
+            WHERE guild_id=$1 AND discord_id=$2 AND game_id<>$3 AND restored_at IS NULL)""",
+            guild_id, discord_id, game_id,
+        )
+
+    async def get_mafia_events(self, game_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetch(
+            "SELECT * FROM mafia_events WHERE game_id=$1 AND message_id IS NULL ORDER BY id", game_id,
+        )
+
+    async def mark_mafia_event_sent(self, event_id: int, message_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute("UPDATE mafia_events SET message_id=$2 WHERE id=$1", event_id, message_id)

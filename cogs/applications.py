@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 from typing import TYPE_CHECKING
+from weakref import WeakValueDictionary
 
 import asyncpg
 import disnake
@@ -9,8 +10,10 @@ from disnake.ext import commands
 
 from access_control import member_access_level
 from config import (
+    APPLICATION_COOLDOWN_DAYS,
     APPLICATION_EXTRA_ACCEPTED_ROLE_IDS,
     APPLICATION_LOG_CHANNEL_ID,
+    DEVELOPER_USER_ID,
     FAMILY_MEMBER_ROLE_ID,
     FAMILY_NAME,
     GUILD_IDS,
@@ -57,7 +60,8 @@ def application_panel() -> tuple[disnake.Embed, list[disnake.ui.Button]]:
         title=FAMILY_NAME,
         description=(
             "Заполните анкету для вступления в объединённую семью. "
-            "После отправки будет создан приватный тикет с рекрутёрами."
+            "После отправки будет создан приватный тикет с рекрутёрами.\n\n"
+            f"Подавать заявки можно раз в {APPLICATION_COOLDOWN_DAYS} дней."
         ),
         color=disnake.Color.red(),
     )
@@ -134,6 +138,15 @@ class ApplicationModal(disnake.ui.Modal):
     async def callback(self, inter: disnake.ModalInteraction) -> None:
         if not isinstance(inter.author, disnake.Member):
             return
+        # Serialize submissions from multiple open forms for the same user.
+        key = (inter.guild_id, inter.author.id)
+        lock = self.cog.application_submission_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            await self._submit_application(inter)
+
+    async def _submit_application(self, inter: disnake.ModalInteraction) -> None:
+        if not await self.cog.can_submit_application(inter):
+            return
         try:
             age = int(inter.text_values["ooc_age"])
         except ValueError:
@@ -205,6 +218,7 @@ class ApplicationModal(disnake.ui.Modal):
             matched_ids = format_blacklist_matches(blacklist_entries)
             await send_admin_log(
                 self.cog.bot,
+                channel_id=APPLICATION_LOG_CHANNEL_ID,
                 title="🚨 Заявка от пользователя из ЧС",
                 description=(
                     f"Заявка: `#{application['id']}` в **{self.family_name}**\n"
@@ -258,6 +272,49 @@ class ApplicationModal(disnake.ui.Modal):
 class ApplicationsCog(commands.Cog):
     def __init__(self, bot: "IntoleranceBot") -> None:
         self.bot = bot
+        self.application_submission_locks: WeakValueDictionary[
+            tuple[int | None, int], asyncio.Lock
+        ] = WeakValueDictionary()
+
+    async def can_submit_application(
+        self, inter: disnake.MessageInteraction | disnake.ModalInteraction
+    ) -> bool:
+        if inter.guild_id not in GUILD_IDS:
+            return False
+        try:
+            blocked = (
+                inter.author.id != DEVELOPER_USER_ID
+                and await self.bot.database.is_application_blocked(
+                    inter.guild_id, inter.author.id
+                )
+            )
+            cooldown_until = (
+                await self.bot.database.get_application_cooldown_until(
+                    inter.guild_id, inter.author.id
+                ) if not blocked else None
+            )
+        except (asyncpg.PostgresError, OSError, RuntimeError):
+            logging.exception("Could not check application eligibility")
+            await inter.response.send_message(
+                "Не удалось проверить доступ к заявкам. Попробуйте позже.",
+                ephemeral=True,
+            )
+            return False
+        if blocked:
+            await inter.response.send_message(
+                "Вам заблокирована подача заявок. Обратитесь к администрации.",
+                ephemeral=True,
+            )
+            return False
+        if cooldown_until is not None and cooldown_until > disnake.utils.utcnow():
+            timestamp = int(cooldown_until.timestamp())
+            await inter.response.send_message(
+                f"Подавать заявки можно раз в {APPLICATION_COOLDOWN_DAYS} дней. "
+                f"Следующая подача доступна <t:{timestamp}:F> (<t:{timestamp}:R>).",
+                ephemeral=True,
+            )
+            return False
+        return True
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
@@ -590,6 +647,7 @@ class ApplicationsCog(commands.Cog):
 
         await send_admin_log(
             self.bot,
+            channel_id=APPLICATION_LOG_CHANNEL_ID,
             title=f"🧾 Заявка #{application_id}: Отклонён автоматически",
             description=(
                 f"Кандидат: {member} (`{member.id}`)\n"
@@ -618,6 +676,73 @@ class ApplicationsCog(commands.Cog):
     async def applications(self, inter: disnake.ApplicationCommandInteraction) -> None:
         pass
 
+    @applications.sub_command(name="block", description="Заблокировать подачу заявок пользователю (уровень 5)")
+    async def applications_block(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        user: disnake.User = commands.Param(description="Пользователь, которому запретить подачу заявок"),
+        reason: str = commands.Param(description="Причина блокировки", max_length=1000),
+    ) -> None:
+        if inter.guild_id not in GUILD_IDS:
+            return
+        if user.id == DEVELOPER_USER_ID:
+            await inter.response.send_message(
+                "Нельзя заблокировать подачу заявок разработчику (уровень 6).",
+                ephemeral=True,
+            )
+            return
+        reason = reason.strip()
+        if not reason:
+            await inter.response.send_message("Укажите причину блокировки.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True)
+        try:
+            await self.bot.database.block_applications(
+                inter.guild_id, user.id, reason, inter.author.id
+            )
+        except (asyncpg.PostgresError, OSError, RuntimeError):
+            logging.exception("Could not block applications")
+            await inter.edit_original_response("Не удалось сохранить блокировку. Попробуйте позже.")
+            return
+        await inter.edit_original_response(f"✅ Подача заявок для {user.mention} заблокирована.")
+        await send_admin_log(
+            self.bot,
+            channel_id=APPLICATION_LOG_CHANNEL_ID,
+            title="🛑 Подача заявок заблокирована",
+            description=(
+                f"Пользователь: {user.mention} (`{user.id}`)\n"
+                f"Администратор: {inter.author.mention}\nПричина: {reason}"
+            ),
+            color=disnake.Color.red(),
+        )
+
+    @applications.sub_command(name="unblock", description="Разрешить пользователю снова подавать заявки (уровень 5)")
+    async def applications_unblock(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        user: disnake.User = commands.Param(description="Пользователь, с которого снять блокировку"),
+    ) -> None:
+        if inter.guild_id not in GUILD_IDS:
+            return
+        await inter.response.defer(ephemeral=True)
+        try:
+            removed = await self.bot.database.unblock_applications(inter.guild_id, user.id)
+        except (asyncpg.PostgresError, OSError, RuntimeError):
+            logging.exception("Could not unblock applications")
+            await inter.edit_original_response("Не удалось снять блокировку. Попробуйте позже.")
+            return
+        if not removed:
+            await inter.edit_original_response("У пользователя нет блокировки подачи заявок.")
+            return
+        await inter.edit_original_response(f"✅ {user.mention} снова может подавать заявки.")
+        await send_admin_log(
+            self.bot,
+            channel_id=APPLICATION_LOG_CHANNEL_ID,
+            title="✅ Блокировка подачи заявок снята",
+            description=f"Пользователь: {user.mention} (`{user.id}`)\nАдминистратор: {inter.author.mention}",
+            color=disnake.Color.green(),
+        )
+
     @commands.Cog.listener("on_dropdown")
     async def application_server_select(
         self, inter: disnake.MessageInteraction
@@ -625,7 +750,7 @@ class ApplicationsCog(commands.Cog):
         custom_id = inter.component.custom_id or ""
         if not custom_id.startswith("family_application:server:"):
             return
-        if inter.guild_id is None:
+        if not await self.can_submit_application(inter):
             return
 
         try:
@@ -709,6 +834,7 @@ class ApplicationsCog(commands.Cog):
         await inter.edit_original_response(f"✅ Панель создана в {panel_channel.mention}.")
         await send_admin_log(
             self.bot,
+            channel_id=APPLICATION_LOG_CHANNEL_ID,
             title="🧾 Панель заявок настроена",
             description=(
                 f"Администратор: {inter.author.mention}\n"
@@ -724,7 +850,7 @@ class ApplicationsCog(commands.Cog):
     async def application_button(self, inter: disnake.MessageInteraction) -> None:
         custom_id = inter.component.custom_id or ""
         if custom_id == "family_application:open" or custom_id.startswith("family_application:open:"):
-            if inter.guild_id is None:
+            if not await self.can_submit_application(inter):
                 return
             family = await self.bot.database.get_family_by_name(
                 inter.guild_id, FAMILY_NAME
@@ -788,6 +914,7 @@ class ApplicationsCog(commands.Cog):
             )
             await send_admin_log(
                 self.bot,
+                channel_id=APPLICATION_LOG_CHANNEL_ID,
                 title=f"🗑️ Тикет заявки #{application_id} удалён",
                 description=f"Рекрутёр: {inter.author.mention}\nКанал: {inter.channel.mention}",
                 color=disnake.Color.red(),
@@ -1041,6 +1168,7 @@ class ApplicationsCog(commands.Cog):
             )
         await send_admin_log(
             self.bot,
+            channel_id=APPLICATION_LOG_CHANNEL_ID,
             title=f"🧾 Заявка #{application_id}: {STATUS_NAMES[status]}",
             description=f"Рекрутёр: {inter.author.mention}\nКандидат: <@{application['discord_id']}> (`{application['discord_id']}`)",
             color={

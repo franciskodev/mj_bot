@@ -18,6 +18,8 @@
 - Enforce command access through the existing access-level system.
 - Security and role-moderation logic must respect Discord role hierarchy and the
   level 6 developer exemption.
+- Exception for Mafia: temporarily remove the developer's administrator roles
+  during a game, preserve access level 6, and restore the roles afterward.
 - Protection against channel deletion, role deletion, and role removal must ignore
   actions performed by this bot itself.
 - Do not remove DM forwarding or the shared `INTERPOLOV & INTOLERANCE` recruitment

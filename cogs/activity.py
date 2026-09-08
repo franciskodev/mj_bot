@@ -13,6 +13,7 @@ from config import (
     FAMILY_MEMBER_ROLE_ID,
     FAMILY_MEMBER_TRIGGER_ROLE_IDS,
     GUILD_ID,
+    INACTIVITY_LOG_CHANNEL_ID,
     TARGET_ROLE_IDS,
 )
 from database import BotInstanceLockLost, INSTANCE_LOCK_HEARTBEAT_SECONDS
@@ -736,7 +737,7 @@ class ActivityCog(commands.Cog):
             member = guild.get_member(profile["discord_id"])
             if member is None:
                 continue
-            if member.guild_permissions.administrator:
+            if member.guild_permissions.administrator or await self.bot.database.get_mafia_saved_access(guild.id, member.id) >= 5:
                 continue
             if await self.ensure_voice_tracking_fresh(
                 expected_generation=generation,
@@ -765,6 +766,7 @@ class ActivityCog(commands.Cog):
                 await self.bot.database.record_inactivity_notice(member.id)
                 await send_admin_log(
                     self.bot,
+                    channel_id=INACTIVITY_LOG_CHANNEL_ID,
                     title="⚠️ Обнаружена неактивность",
                     description=(
                         f"Пользователь: {member.mention} (`{member.id}`)\n"
@@ -783,7 +785,7 @@ class ActivityCog(commands.Cog):
                     member.id,
                 )
                 continue
-            if member.guild_permissions.administrator:
+            if member.guild_permissions.administrator or await self.bot.database.get_mafia_saved_access(guild.id, member.id) >= 5:
                 continue
             if await self.ensure_voice_tracking_fresh(
                 expected_generation=generation,
@@ -837,6 +839,7 @@ class ActivityCog(commands.Cog):
                 )
                 await send_admin_log(
                     self.bot,
+                    channel_id=INACTIVITY_LOG_CHANNEL_ID,
                     title="⚠️ Семейные роли недоступны для снятия",
                     description=(
                         f"Профиль {member.mention} (`{member.id}`) не деактивирован. "
@@ -867,6 +870,7 @@ class ActivityCog(commands.Cog):
                 )
                 await send_admin_log(
                     self.bot,
+                    channel_id=INACTIVITY_LOG_CHANNEL_ID,
                     title="⚠️ Проверка активности остановлена",
                     description=(
                         f"Роли у {member.mention} (`{member.id}`) не снимались: "
@@ -926,6 +930,7 @@ class ActivityCog(commands.Cog):
                     )
                     await send_admin_log(
                         self.bot,
+                        channel_id=INACTIVITY_LOG_CHANNEL_ID,
                         title="⚠️ Ошибка снятия ролей",
                         description=(
                             f"Не удалось снять роли у {member.mention} (`{member.id}`).\n"
@@ -944,6 +949,7 @@ class ActivityCog(commands.Cog):
                     )
                     await send_admin_log(
                         self.bot,
+                        channel_id=INACTIVITY_LOG_CHANNEL_ID,
                         title="⚠️ Требуется повторная деактивация",
                         description=(
                             f"Роли у {member.mention} (`{member.id}`) сняты, но БД "
@@ -954,6 +960,7 @@ class ActivityCog(commands.Cog):
                     continue
                 await send_admin_log(
                     self.bot,
+                    channel_id=INACTIVITY_LOG_CHANNEL_ID,
                     title="🧹 Роли сняты за неактивность",
                     description=f"Пользователь: {member} (`{member.id}`)\nПричина: **{reason}**\nСнятые роли: **{role_names}**",
                     color=disnake.Color.red(),

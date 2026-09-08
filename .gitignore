@@ -1,8 +1,64 @@
+# Local secrets; keep the public configuration template
 .env
-.bash_history
-.cache/
+.env.*
+!.env.example
+
+# Python virtual environments and bytecode
 .venv/
 venv/
+env/
+ENV/
 __pycache__/
 *.py[cod]
-data/applications/
+
+# Build, test and tool artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cache/
+
+# Runtime data, logs and local database copies
+/data/
+/logs/
+/backups/
+*.log
+*.log.*
+*.pid
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.dump
+*.sql.gz
+
+# Editor settings, OS metadata and local backup files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+.bash_history
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej

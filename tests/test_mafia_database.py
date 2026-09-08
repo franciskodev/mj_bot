@@ -1,0 +1,215 @@
+"""Integration tests use an isolated temporary PostgreSQL cluster, never .env."""
+import asyncio
+import getpass
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+import asyncpg
+
+from cogs import mafia_game as rules
+from database import Database
+
+
+class DatabaseTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        binary = shutil.which('initdb')
+        if binary is None:
+            candidates = sorted(Path('/usr/lib/postgresql').glob('*/bin/initdb'))
+            binary = str(candidates[-1]) if candidates else None
+        if binary is None:
+            raise unittest.SkipTest('PostgreSQL server binaries are not installed')
+        cls.pg_ctl = str(Path(binary).with_name('pg_ctl'))
+        cls.temp = tempfile.TemporaryDirectory(prefix='mafia-test-')
+        cls.root = Path(cls.temp.name)
+        cls.data = cls.root / 'data'
+        try:
+            subprocess.run([binary, '-D', str(cls.data), '-A', 'trust', '--no-locale', '-E', 'UTF8'],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([cls.pg_ctl, '-D', str(cls.data), '-l', str(cls.root / 'postgres.log'),
+                            '-o', f"-h '' -k {cls.root} -p 55439", '-w', 'start'],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            cls.temp.cleanup()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            subprocess.run([cls.pg_ctl, '-D', str(cls.data), '-m', 'fast', '-w', 'stop'],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        finally:
+            cls.temp.cleanup()
+
+    async def asyncSetUp(self):
+        self.db = Database()
+        self.db.pool = await asyncpg.create_pool(host=str(self.root), port=55439,
+                                                 user=getpass.getuser(), database='postgres', min_size=1, max_size=5)
+        source = (Path(__file__).resolve().parents[1] / 'database.py').read_text()
+        schema = source.split('CREATE TABLE IF NOT EXISTS mafia_games (', 1)[1].split('CREATE TABLE IF NOT EXISTS giveaways (', 1)[0]
+        await self.db.pool.execute('CREATE TABLE IF NOT EXISTS mafia_games (' + schema)
+        await self.db.pool.execute('TRUNCATE mafia_events,mafia_role_holds,mafia_results,mafia_games RESTART IDENTITY')
+
+    async def asyncTearDown(self):
+        await self.db.pool.close()
+
+    async def create_started_game(self, guild=1):
+        state = rules.new_game(1)
+        for uid in range(1, 7):
+            rules.join(state, uid, str(uid))
+        rules.start(state, 100)
+        for uid, role in zip(state['players'], ('mafia', 'mafia', 'doctor', 'commissioner', 'civilian', 'civilian')):
+            state['players'][uid]['role'] = role
+        return await self.db.create_mafia_game(guild, 123, state)
+
+    async def finish_game(self, game_id, winner='town', guild=1):
+        async with self.db.mafia_transaction(guild, game_id) as game:
+            rules.finish(game['state'], winner)
+
+    async def test_only_one_active_game(self):
+        outcomes = await asyncio.gather(*(self.db.create_mafia_game(1, 123, rules.new_game(uid)) for uid in range(5)), return_exceptions=True)
+        self.assertEqual(sum(isinstance(result, int) for result in outcomes), 1)
+        self.assertEqual(sum(isinstance(result, asyncpg.UniqueViolationError) for result in outcomes), 4)
+        self.assertIsNone(await self.db.get_mafia_game(2))
+
+    async def test_simultaneous_joins_and_capacity(self):
+        game_id = await self.db.create_mafia_game(1, 123, rules.new_game(1))
+        async def join(uid):
+            async with self.db.mafia_transaction(1, game_id) as game:
+                rules.join(game['state'], uid, str(uid))
+                await asyncio.sleep(0.001)
+        outcomes = await asyncio.gather(*(join(uid) for uid in range(13)), return_exceptions=True)
+        self.assertEqual(sum(isinstance(result, rules.GameError) for result in outcomes), 1)
+        game = await self.db.get_mafia_game(1, game_id)
+        self.assertEqual(len(game['state']['players']), 12)
+        self.assertEqual(game['revision'], 13)
+
+    async def test_state_rollback_and_restart(self):
+        game_id = await self.create_started_game()
+        async with self.db.mafia_transaction(1, game_id) as game:
+            rules.act(game['state'], 4, '1', 1, 110)
+            rules.toggle_pause(game['state'], 111)
+        try:
+            async with self.db.mafia_transaction(1, game_id) as game:
+                rules.cancel(game['state'])
+                raise RuntimeError('rollback')
+        except RuntimeError:
+            pass
+        reopened = Database()
+        reopened.pool = self.db.pool
+        game = await reopened.get_mafia_game(1, game_id)
+        self.assertTrue(game['state']['paused'])
+        self.assertEqual(game['state']['players']['4']['checks'], {'1': 'Мафия'})
+        self.assertEqual(game['state']['remaining'], 49)
+        self.assertTrue(game['active'])
+        self.assertEqual(await self.db.pool.fetchval('SELECT COUNT(*) FROM mafia_results'), 0)
+
+    async def test_finishing_is_atomic_and_idempotent(self):
+        game_id = await self.create_started_game()
+        async def finish():
+            async with self.db.mafia_transaction(1, game_id) as game:
+                if game['state']['phase'] != 'finished':
+                    rules.finish(game['state'], 'town')
+        await asyncio.gather(*(finish() for _ in range(4)))
+        self.assertEqual(await self.db.pool.fetchval('SELECT COUNT(*) FROM mafia_results'), 6)
+        self.assertEqual(await self.db.pool.fetchval('SELECT COUNT(*) FROM mafia_results WHERE won'), 4)
+        game = await self.db.get_mafia_game(1, game_id)
+        self.assertFalse(game['active'])
+        results = await self.db.mafia_leaderboard(1)
+        self.assertEqual(results[0]['points'], 3)
+        self.assertEqual(results[-1]['points'], 1)
+        await self.db.set_mafia_message(game_id, 999, game['revision'])
+        for event in await self.db.get_mafia_events(game_id):
+            await self.db.mark_mafia_event_sent(event['id'], 1000 + event['id'])
+        self.assertEqual(await self.db.pending_mafia_games(1), [])
+        await self.create_started_game()
+
+    async def test_cancel_does_not_score_and_finalization_rollback(self):
+        game_id = await self.create_started_game()
+        with self.assertRaises(RuntimeError):
+            async with self.db.mafia_transaction(1, game_id) as game:
+                rules.finish(game['state'], 'town')
+                raise RuntimeError('rollback')
+        self.assertEqual(await self.db.pool.fetchval('SELECT COUNT(*) FROM mafia_results'), 0)
+        async with self.db.mafia_transaction(1, game_id) as game:
+            rules.cancel(game['state'])
+        self.assertEqual(await self.db.mafia_leaderboard(1), [])
+
+    async def test_leaderboards_and_time_filters(self):
+        for _ in range(5):
+            await self.finish_game(await self.create_started_game())
+        for metric in ('points', 'wins', 'games', 'win_rate', 'mafia_wins', 'town_wins', 'survived'):
+            rows = await self.db.mafia_leaderboard(1, metric)
+            self.assertEqual(len(rows), 6)
+        self.assertEqual((await self.db.mafia_leaderboard(1, 'win_rate'))[0]['win_rate'], 100)
+        stats = await self.db.mafia_leaderboard(1, user_id=1)
+        self.assertEqual(stats[0]['games'], 5)
+        self.assertEqual(stats[0]['wins'], 0)
+        self.assertEqual(stats[0]['points'], 5)
+        self.assertEqual(await self.db.mafia_leaderboard(2), [])
+        await self.db.pool.execute("UPDATE mafia_results SET finished_at=NOW()-INTERVAL '8 days' WHERE game_id=1")
+        self.assertEqual(await self.db.mafia_leaderboard(1, 'win_rate', 7), [])
+        self.assertEqual((await self.db.mafia_leaderboard(1, 'games', 7))[0]['games'], 4)
+        self.assertEqual((await self.db.mafia_leaderboard(1, 'games', 30))[0]['games'], 5)
+        with self.assertRaises(ValueError):
+            await self.db.mafia_leaderboard(1, 'invalid')
+
+    async def test_role_hold_survives_restart_and_game_end(self):
+        game_id = await self.create_started_game()
+        await self.db.hold_mafia_roles(game_id, 1, 1, [100, 200], 5)
+        await self.db.hold_mafia_roles(game_id, 1, 1, [200, 300], 4)
+        reopened = Database()
+        reopened.pool = self.db.pool
+        self.assertEqual(await reopened.get_mafia_saved_access(1, 1), 5)
+        self.assertEqual(await reopened.get_mafia_saved_access(2, 1), 0)
+        holds = await reopened.get_mafia_role_holds(game_id)
+        self.assertEqual(set(holds[0]['role_ids']), {100, 200, 300})
+        await self.finish_game(game_id)
+        self.assertEqual(await reopened.get_mafia_saved_access(1, 1), 5)
+        self.assertTrue(await reopened.has_other_mafia_role_hold(1, 1, game_id + 1))
+        self.assertFalse(await reopened.has_other_mafia_role_hold(1, 1, game_id))
+        await reopened.finish_mafia_role_hold(game_id, 1)
+        self.assertEqual(await reopened.get_mafia_saved_access(1, 1), 0)
+        self.assertEqual(await reopened.get_mafia_role_holds(game_id), [])
+
+    async def test_rooms_and_public_events_are_durable(self):
+        game_id = await self.create_started_game()
+        async with self.db.mafia_transaction(1, game_id) as game:
+            rules.act(game['state'], 4, '1', 1, 110)
+        self.assertEqual(await self.db.get_mafia_events(game_id), [])
+        async with self.db.mafia_transaction(1, game_id) as game:
+            game['state']['rooms'] = {'events': 12345, 'mafia_text': 12346}
+        game = await self.db.get_mafia_game(1, game_id)
+        self.assertEqual(game['channel_id'], 12345)
+        async with self.db.mafia_transaction(1, game_id) as game:
+            rules.advance(game['state'], 160)
+        events = await self.db.get_mafia_events(game_id)
+        self.assertEqual(len(events), 1)
+        self.assertNotIn('checks', events[0]['payload'])
+        self.assertNotIn('players', events[0]['payload'])
+        await self.db.mark_mafia_event_sent(events[0]['id'], 222)
+        self.assertEqual(await self.db.get_mafia_events(game_id), [])
+
+    async def test_existing_role_hold_schema_upgrades_to_level_six(self):
+        game_id = await self.create_started_game()
+        await self.db.hold_mafia_roles(game_id, 1, 1, [100], 5)
+        await self.db.pool.execute('''
+            ALTER TABLE mafia_role_holds DROP CONSTRAINT mafia_role_holds_access_level_check;
+            ALTER TABLE mafia_role_holds ADD CONSTRAINT mafia_role_holds_access_level_check
+                CHECK(access_level BETWEEN 0 AND 5);
+        ''')
+        source = (Path(__file__).resolve().parents[1] / 'database.py').read_text()
+        migration = 'ALTER TABLE mafia_role_holds' + source.split('ALTER TABLE mafia_role_holds', 1)[1].split('CREATE TABLE IF NOT EXISTS mafia_events', 1)[0]
+        await self.db.pool.execute(migration)
+        await self.db.hold_mafia_roles(game_id, 1, 2, [200], 6)
+        self.assertEqual(await self.db.get_mafia_saved_access(1, 1), 5)
+        self.assertEqual(await self.db.get_mafia_saved_access(1, 2), 6)
+        await self.db.pool.execute(migration)
+        self.assertEqual(await self.db.get_mafia_saved_access(1, 2), 6)
+
+
+if __name__ == '__main__':
+    unittest.main()
