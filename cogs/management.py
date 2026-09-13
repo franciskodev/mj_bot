@@ -8,62 +8,16 @@ from config import (
     APPEAL_LOG_CHANNEL_ID,
     GUILD_IDS,
     MANAGEMENT_LOG_CHANNEL_ID,
-    PROMOTION_LOG_CHANNEL_ID,
     WARNING_WORKOFF_LOG_CHANNEL_ID,
 )
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
     from cogs.leave import LeaveCog
 
 
 def optional_value(value: str) -> str:
     return value.strip() or "Не указаны"
-
-
-class PromotionModal(disnake.ui.Modal):
-    def __init__(self, cog: "ManagementCog") -> None:
-        self.cog = cog
-        super().__init__(
-            title="Заявка на повышение",
-            custom_id="management:promotion:modal",
-            components=[
-                disnake.ui.TextInput(
-                    label="Что вы сделали",
-                    custom_id="achievements",
-                    style=disnake.TextInputStyle.paragraph,
-                    max_length=1500,
-                ),
-                disnake.ui.TextInput(
-                    label="Доказательства (при наличии)",
-                    custom_id="evidence",
-                    style=disnake.TextInputStyle.paragraph,
-                    required=False,
-                    max_length=1000,
-                ),
-            ],
-            timeout=600,
-        )
-
-    async def callback(self, inter: disnake.ModalInteraction) -> None:
-        achievements = inter.text_values["achievements"].strip()
-        if not achievements:
-            await inter.response.send_message(
-                "Опишите, что вы сделали для повышения.", ephemeral=True
-            )
-            return
-        embed = self.cog.request_embed(inter, "📈 Заявка на повышение")
-        embed.add_field(name="Что сделано", value=achievements, inline=False)
-        embed.add_field(
-            name="Доказательства",
-            value=optional_value(inter.text_values["evidence"]),
-            inline=False,
-        )
-        await self.cog.send_request(
-            inter,
-            embed,
-            channel_id=PROMOTION_LOG_CHANNEL_ID,
-        )
 
 
 class AppealModal(disnake.ui.Modal):
@@ -195,7 +149,7 @@ class WarningWorkoffModal(disnake.ui.Modal):
 
 
 class ManagementCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
 
     def request_embed(
@@ -210,7 +164,7 @@ class ManagementCog(commands.Cog):
             timestamp=disnake.utils.utcnow(),
         )
         embed.set_thumbnail(url=inter.author.display_avatar.url)
-        embed.set_footer(text="INTERPOLOV & INTOLERANCE • Управление")
+        embed.set_footer(text="INTERPOLOV • Управление")
         return embed
 
     async def get_active_warning(self, discord_id: int, warning_id: int):
@@ -375,7 +329,11 @@ class ManagementCog(commands.Cog):
             return
 
         if custom_id == "management:promotion":
-            await inter.response.send_modal(PromotionModal(self))
+            cog = self.bot.get_cog("PromotionsCog")
+            if cog is None:
+                await inter.response.send_message("Система повышений временно недоступна.", ephemeral=True)
+                return
+            await cog.start_request(inter)
             return
 
         if custom_id not in {"management:appeal", "management:workoff"}:

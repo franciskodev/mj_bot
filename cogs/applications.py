@@ -1,6 +1,8 @@
 import asyncio
+from contextlib import closing
 import logging
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 from weakref import WeakValueDictionary
 
@@ -8,7 +10,7 @@ import asyncpg
 import disnake
 from disnake.ext import commands
 
-from access_control import member_access_level
+from access_control import application_staff_role_ids, can_review_application
 from config import (
     APPLICATION_COOLDOWN_DAYS,
     APPLICATION_EXTRA_ACCEPTED_ROLE_IDS,
@@ -19,11 +21,11 @@ from config import (
     GUILD_IDS,
 )
 from cogs.systems import format_blacklist_matches, parse_static_ids
-from log_utils import send_admin_log
-from transcript import save_application_json, save_ticket_transcript
+from log_utils import application_log_channel, send_admin_log
+from transcript import SavedTranscript, save_application_json, save_ticket_transcript
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 STATUS_NAMES = {
@@ -35,10 +37,10 @@ STATUS_NAMES = {
 }
 def server_select(family_id: int, server_rows) -> disnake.ui.StringSelect:
     return disnake.ui.StringSelect(
-        placeholder="Выберите один или несколько серверов",
+        placeholder="Выберите игровой сервер",
         custom_id=f"family_application:server:{family_id}",
         min_values=1,
-        max_values=min(len(server_rows), 25),
+        max_values=1,
         options=[
             disnake.SelectOption(label=row["name"], value=str(row["id"]))
             for row in server_rows[:25]
@@ -59,7 +61,7 @@ def application_panel() -> tuple[disnake.Embed, list[disnake.ui.Button]]:
     embed = disnake.Embed(
         title=FAMILY_NAME,
         description=(
-            "Заполните анкету для вступления в объединённую семью. "
+            "Заполните анкету для вступления в семью INTERPOLOV. "
             "После отправки будет создан приватный тикет с рекрутёрами.\n\n"
             f"Подавать заявки можно раз в {APPLICATION_COOLDOWN_DAYS} дней."
         ),
@@ -107,7 +109,7 @@ def application_embed(
     embed.add_field(name="🖼️ Фото всех персонажей", value=application["screenshot_url"], inline=False)
     embed.add_field(name="👤 Пользователь", value=f"{applicant.mention}\n`{applicant}` · `{applicant.id}`", inline=False)
     embed.add_field(name="📌 Статус", value=STATUS_NAMES[application["status"]], inline=False)
-    embed.set_footer(text="INTERPOLOV & INTOLERANCE • Общий набор")
+    embed.set_footer(text="INTERPOLOV • Общий набор")
     return embed
 
 
@@ -119,7 +121,7 @@ class ApplicationModal(disnake.ui.Modal):
         self.cog = cog
         self.config = config
         self.family_id = family["id"]
-        self.family_name = family["name"]
+        self.family_name = FAMILY_NAME
         self.game_server = game_server
         components = [
             disnake.ui.TextInput(label="Ваш ник в игре", custom_id="game_nickname", max_length=100),
@@ -142,7 +144,13 @@ class ApplicationModal(disnake.ui.Modal):
         key = (inter.guild_id, inter.author.id)
         lock = self.cog.application_submission_locks.setdefault(key, asyncio.Lock())
         async with lock:
-            await self._submit_application(inter)
+            if self.cog.ticket_access_lock.locked():
+                await inter.response.send_message(
+                    "Обновляются права заявок. Попробуйте отправить анкету немного позже.", ephemeral=True
+                )
+                return
+            async with self.cog.ticket_access_lock:
+                await self._submit_application(inter)
 
     async def _submit_application(self, inter: disnake.ModalInteraction) -> None:
         if not await self.cog.can_submit_application(inter):
@@ -170,24 +178,16 @@ class ApplicationModal(disnake.ui.Modal):
         if guild is None:
             return
         category = guild.get_channel(self.config["category_id"])
-        staff_roles = await self.cog.application_staff_roles(guild)
+        staff_roles = await self.cog.application_staff_roles(guild, self.game_server)
         if not isinstance(category, disnake.CategoryChannel) or not staff_roles or guild.me is None:
             await inter.edit_original_response(
-                "Настройки тикетов устарели или для уровней доступа 2–4 не назначены "
-                "роли. Сообщите администратору."
+                "Для выбранного сервера не настроены роли рекрутёров и High или категория тикетов. "
+                "Сообщите администратору: `/applications roles`."
             )
             return
 
         safe_name = re.sub(r"[^a-z0-9-]", "", inter.author.name.lower().replace("_", "-"))[:40] or str(inter.author.id)
-        overwrites = {
-            guild.default_role: disnake.PermissionOverwrite(view_channel=False),
-            inter.author: disnake.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me: disnake.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
-        }
-        for staff_role in staff_roles:
-            overwrites[staff_role] = disnake.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True
-            )
+        overwrites = self.cog.ticket_overwrites(guild, inter.author, staff_roles)
         try:
             ticket = await category.create_text_channel(
                 f"family-{self.family_id}-{safe_name}",
@@ -230,7 +230,10 @@ class ApplicationModal(disnake.ui.Modal):
                 ),
                 color=disnake.Color.red(),
             )
-        previous = await self.cog.bot.database.get_previous_applications(inter.author.id, application["id"])
+        previous = [
+            row for row in await self.cog.bot.database.get_previous_applications(inter.author.id, application["id"])
+            if row["guild_id"] == guild.id and row["game_server"] == self.game_server
+        ]
         application_json_path = None
         try:
             application_json_path = await save_application_json(application, previous)
@@ -246,15 +249,10 @@ class ApplicationModal(disnake.ui.Modal):
             components=application_buttons(application["id"]),
         )
         await self.cog.bot.database.set_application_ticket(application["id"], ticket.id, message.id)
-        application_log_channel = self.cog.bot.get_channel(APPLICATION_LOG_CHANNEL_ID)
-        if application_log_channel is None:
+        archive = await application_log_channel(self.cog.bot)
+        if archive is not None:
             try:
-                application_log_channel = await self.cog.bot.fetch_channel(APPLICATION_LOG_CHANNEL_ID)
-            except disnake.DiscordException:
-                logging.exception("Could not fetch application log channel")
-        if isinstance(application_log_channel, (disnake.TextChannel, disnake.Thread)):
-            try:
-                await application_log_channel.send(
+                await archive.send(
                     content=(
                         f"🧾 **Новая заявка в {self.family_name} #{application['id']}**\n"
                         f"Кандидат: {inter.author.mention} · Тикет: {ticket.mention}"
@@ -264,14 +262,13 @@ class ApplicationModal(disnake.ui.Modal):
                 )
             except disnake.DiscordException:
                 logging.exception("Could not send application log")
-        elif application_log_channel is not None:
-            logging.error("Application log channel %s is not a text channel", APPLICATION_LOG_CHANNEL_ID)
         await inter.edit_original_response(f"✅ Заявка создана: {ticket.mention}")
 
 
 class ApplicationsCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
+        self.ticket_access_lock = asyncio.Lock()
         self.application_submission_locks: WeakValueDictionary[
             tuple[int | None, int], asyncio.Lock
         ] = WeakValueDictionary()
@@ -318,7 +315,11 @@ class ApplicationsCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
+        await application_log_channel(self.bot)
         for guild_id in GUILD_IDS:
+            failures = await self.sync_ticket_access(guild_id)
+            if failures:
+                logging.error("Could not fully migrate %s application tickets in guild %s", failures, guild_id)
             await self.refresh_application_panel(guild_id)
             await self._repair_finalized_application_tickets(guild_id)
 
@@ -339,21 +340,76 @@ class ApplicationsCog(commands.Cog):
         return True
 
     async def application_staff_roles(
-        self, guild: disnake.Guild
+        self, guild: disnake.Guild, game_server: str
     ) -> list[disnake.Role]:
-        role_ids = [
-            row["role_id"]
-            for row in await self.bot.database.get_access_roles(guild.id)
-            if 2 <= row["access_level"] <= 4
-        ]
-        for department in await self.bot.database.get_department_configs(guild.id):
-            role_ids.append(department["head_role_id"])
-            if department["department"] == "recruiters":
-                role_ids.append(department["member_role_id"])
-        return [
-            role for role_id in dict.fromkeys(role_ids)
-            if (role := guild.get_role(role_id)) is not None
-        ]
+        role_ids = await application_staff_role_ids(self.bot, guild.id, game_server)
+        roles = [guild.get_role(role_id) for role_id in sorted(role_ids)]
+        if len(roles) != 2 or any(role is None or role.is_default() for role in roles):
+            return []
+        return roles
+
+    @staticmethod
+    def ticket_overwrites(guild, applicant, staff_roles) -> dict:
+        overwrites = {
+            guild.default_role: disnake.PermissionOverwrite(view_channel=False),
+            guild.me: disnake.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                manage_channels=True, attach_files=True, embed_links=True,
+            ),
+        }
+        if applicant is not None:
+            overwrites[applicant] = disnake.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+            )
+        for role in staff_roles:
+            overwrites[role] = disnake.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+            )
+        return overwrites
+
+    async def sync_ticket_access(self, guild_id: int) -> int:
+        async with self.ticket_access_lock:
+            return await self._sync_ticket_access(guild_id)
+
+    async def _sync_ticket_access(self, guild_id: int) -> int:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None or guild.me is None:
+            return 1
+        failures = 0
+        for application in await self.bot.database.get_ticket_applications(guild_id):
+            try:
+                channel = guild.get_channel(application["ticket_channel_id"])
+                if channel is None:
+                    try:
+                        channel = await guild.fetch_channel(application["ticket_channel_id"])
+                    except disnake.NotFound:
+                        continue
+                if not isinstance(channel, disnake.TextChannel) or channel.guild.id != guild_id:
+                    continue
+                applicant = guild.get_member(application["discord_id"])
+                # Revoke the old grants before cleaning historical cards. If an
+                # API call fails, do not expose another server's old history.
+                private_overwrites = self.ticket_overwrites(guild, applicant, [])
+                if channel.overwrites != private_overwrites:
+                    await channel.edit(overwrites=private_overwrites, reason="Обновление приватности заявки")
+                if applicant is None:
+                    try:
+                        applicant = await guild.fetch_member(application["discord_id"])
+                    except disnake.NotFound:
+                        pass
+                if application["ticket_message_id"] is not None:
+                    message = await channel.fetch_message(application["ticket_message_id"])
+                    if not await self._sync_application_message(message, application):
+                        failures += 1
+                        continue
+                roles = await self.application_staff_roles(guild, application["game_server"])
+                overwrites = self.ticket_overwrites(guild, applicant, roles)
+                if channel.overwrites != overwrites:
+                    await channel.edit(overwrites=overwrites, reason="Доступ к заявке по серверным ролям")
+            except disnake.DiscordException:
+                failures += 1
+                logging.exception("Could not synchronize access for application %s", application["id"])
+        return failures
 
     async def _repair_finalized_application_tickets(self, guild_id: int) -> None:
         applications = await self.bot.database.get_finalized_ticket_applications(
@@ -372,7 +428,12 @@ class ApplicationsCog(commands.Cog):
                 )
                 continue
             await self._sync_application_message(message, application)
-            if application["transcript_path"]:
+            if (
+                application["transcript_path"]
+                and Path(application["transcript_path"]).suffix == ".html"
+                and Path(application["transcript_path"]).is_file()
+                and application["transcript_log_message_id"]
+            ):
                 await self._ensure_ticket_delete_prompt(
                     channel,
                     application["id"],
@@ -392,15 +453,15 @@ class ApplicationsCog(commands.Cog):
         self,
         channel: disnake.TextChannel,
         application: asyncpg.Record,
-    ):
+    ) -> SavedTranscript | None:
         application_id = application["id"]
         for attempt in range(1, 4):
             try:
-                transcript_path = await save_ticket_transcript(channel, application)
+                transcript = await save_ticket_transcript(channel, application)
                 await self.bot.database.set_application_transcript(
-                    application_id, str(transcript_path)
+                    application_id, str(transcript.html_path)
                 )
-                return transcript_path
+                return transcript
             except Exception:
                 logging.exception(
                     "Could not save transcript for application %s (attempt %s/3)",
@@ -421,6 +482,26 @@ class ApplicationsCog(commands.Cog):
             return False
 
         embed = message.embeds[0]
+        embed.title = f"📝 Заявление в {FAMILY_NAME} #{application['id']}"
+        embed.set_footer(text=f"{FAMILY_NAME} • Набор в семью")
+        previous = [
+            row for row in await self.bot.database.get_previous_applications(
+                application["discord_id"], application["id"]
+            )
+            if row["guild_id"] == application["guild_id"]
+            and row["game_server"] == application["game_server"]
+        ]
+        history = "\n".join(
+            f"`#{row['id']}` · **{FAMILY_NAME}** — "
+            f"**{STATUS_NAMES.get(row['status'], row['status'])}** · "
+            f"<t:{int(row['created_at'].timestamp())}:D>" for row in previous
+        ) or "Заявок не найдено."
+        for index, field in enumerate(embed.fields):
+            if field.name == "🤝 Выбранная фама":
+                embed.set_field_at(index, name=field.name, value=f"**{FAMILY_NAME}**", inline=False)
+            elif field.name == "📚 Предыдущие заявки":
+                embed.set_field_at(index, name=field.name, value=history[:1024], inline=False)
+
         embed.color = {
             "pending": disnake.Color.gold(),
             "accepted": disnake.Color.green(),
@@ -508,42 +589,53 @@ class ApplicationsCog(commands.Cog):
     async def _upload_ticket_transcript(
         self,
         channel: disnake.TextChannel,
-        application_id: int,
+        application: asyncpg.Record,
         status_text: str,
-        transcript_path,
-    ) -> None:
-        application_log_channel = self.bot.get_channel(APPLICATION_LOG_CHANNEL_ID)
-        if application_log_channel is None:
-            try:
-                application_log_channel = await self.bot.fetch_channel(
-                    APPLICATION_LOG_CHANNEL_ID
-                )
-            except disnake.DiscordException:
-                logging.exception("Could not fetch application log channel")
-                return
-        if not isinstance(
-            application_log_channel, (disnake.TextChannel, disnake.Thread)
-        ):
-            logging.error(
-                "Application log channel %s is not a text channel",
-                APPLICATION_LOG_CHANNEL_ID,
+        transcript: SavedTranscript,
+    ) -> bool:
+        application_id = application["id"]
+        archive = await application_log_channel(self.bot)
+        if archive is None:
+            return False
+        embed = disnake.Embed(
+            title=f"📚 Заявка #{application_id} — {status_text}",
+            description="Скачайте HTML-файл и откройте его в браузере, чтобы прочитать переписку.",
+            color=disnake.Color.green() if application["status"] == "accepted" else disnake.Color.red(),
+            timestamp=disnake.utils.utcnow(),
+        )
+        embed.add_field(name="Заявитель", value=f"<@{application['discord_id']}>\n`{application['discord_id']}`")
+        embed.add_field(name="Игровой сервер", value=application["game_server"][:1024])
+        embed.add_field(name="Результат", value=status_text)
+        embed.add_field(name="Рассмотрел", value=f"<@{application['reviewer_id']}>" if application["reviewer_id"] else "Не указан")
+        embed.add_field(name="Сообщений", value=str(transcript.message_count))
+        embed.add_field(name="Вложений", value=str(transcript.attachment_count))
+        if transcript.linked_attachment_count:
+            embed.add_field(
+                name="Вложения по ссылкам",
+                value=f"{transcript.linked_attachment_count} — крупные или недоступные для встраивания. Ссылки Discord могут истечь.",
+                inline=False,
             )
-            return
+        embed.set_footer(text="INTERPOLOV • HTML-архив • Время сообщений в UTC")
         try:
-            await application_log_channel.send(
-                content=(
-                    f"📚 **Транскрипт заявки #{application_id}** · "
-                    f"{status_text} · тикет {channel.mention}"
-                ),
-                file=disnake.File(
-                    str(transcript_path),
-                    filename=f"application-{application_id}.json",
-                ),
-            )
-        except disnake.DiscordException:
+            message = None
+            if application.get("transcript_log_message_id"):
+                try:
+                    message = await archive.fetch_message(application["transcript_log_message_id"])
+                except disnake.NotFound:
+                    pass
+            with closing(disnake.File(str(transcript.html_path), filename=f"application-{application_id}.html")) as file:
+                if message is None:
+                    message = await archive.send(embed=embed, file=file, allowed_mentions=disnake.AllowedMentions.none())
+                else:
+                    await message.edit(content=None, embed=embed, file=file, attachments=[],
+                                       allowed_mentions=disnake.AllowedMentions.none())
+            await self.bot.database.set_application_transcript_log_message(application_id, message.id)
+            return True
+        except (disnake.DiscordException, asyncpg.PostgresError, OSError, RuntimeError):
             logging.exception(
                 "Could not upload transcript for application %s", application_id
             )
+            return False
 
     async def _finalize_ticket(
         self,
@@ -551,12 +643,12 @@ class ApplicationsCog(commands.Cog):
         application: asyncpg.Record,
         status_text: str,
         prompt_text: str,
-    ) -> None:
+    ) -> bool:
         application_id = application["id"]
-        transcript_path = await self._save_ticket_transcript_with_retry(
+        transcript = await self._save_ticket_transcript_with_retry(
             channel, application
         )
-        if transcript_path is None:
+        if transcript is None:
             try:
                 await channel.send(
                     "⚠️ Не удалось сохранить транскрипт после трёх попыток. "
@@ -567,14 +659,21 @@ class ApplicationsCog(commands.Cog):
                     "Could not report transcript failure for application %s",
                     application_id,
                 )
-            return
+            return False
 
+        if not await self._upload_ticket_transcript(channel, application, status_text, transcript):
+            try:
+                await channel.send(
+                    "⚠️ HTML-транскрипт сохранён, но не удалось отправить его в журнал. "
+                    "Тикет пока нельзя удалить; проверьте права бота, размер файла и повторите действие."
+                )
+            except disnake.DiscordException:
+                logging.exception("Could not report transcript upload failure for application %s", application_id)
+            return False
         await self._ensure_ticket_delete_prompt(
             channel, application_id, prompt_text
         )
-        await self._upload_ticket_transcript(
-            channel, application_id, status_text, transcript_path
-        )
+        return True
 
     async def _decline_departed_member_application(
         self, member: disnake.Member, application: asyncpg.Record
@@ -676,6 +775,100 @@ class ApplicationsCog(commands.Cog):
     async def applications(self, inter: disnake.ApplicationCommandInteraction) -> None:
         pass
 
+    @applications.sub_command(name="roles", description="Настроить рекрутёров и High игрового сервера (уровень 5)")
+    async def applications_roles(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        server: str = commands.Param(description="Выберите игровой сервер из списка заявок", max_length=80),
+        recruiter_role: disnake.Role = commands.Param(description="Отдельная роль рекрутёров этого сервера"),
+        high_role: disnake.Role = commands.Param(description="Отдельная роль High этого сервера"),
+    ) -> None:
+        if inter.guild_id not in GUILD_IDS or inter.guild is None:
+            return
+        servers = await self.bot.database.get_game_servers(inter.guild_id)
+        selected = next((row for row in servers if row["name"].casefold() == server.strip().casefold()), None)
+        if selected is None or selected["role_id"] is None or inter.guild.get_role(selected["role_id"]) is None:
+            await inter.response.send_message(
+                "Выберите существующий сервер из списка. Настроить сервер и его роль можно через `/settings server_add`.",
+                ephemeral=True,
+            )
+            return
+        member_role_ids = {row["role_id"] for row in servers} | {
+            row["role_id"] for row in await self.bot.database.get_families(inter.guild_id)
+        } | {FAMILY_MEMBER_ROLE_ID, *APPLICATION_EXTRA_ACCEPTED_ROLE_IDS}
+        roles = (recruiter_role, high_role)
+        if recruiter_role == high_role or any(
+            role.is_default() or role.managed or role.permissions.administrator
+            or role.id in member_role_ids for role in roles
+        ):
+            await inter.response.send_message(
+                "Выберите две отдельные роли сотрудников этого сервера. "
+                "Общие роли участников, ботов и администраторов не подходят; "
+                "администраторы Discord уже видят все заявки.", ephemeral=True,
+            )
+            return
+        await inter.response.defer(ephemeral=True)
+        async with self.ticket_access_lock:
+            try:
+                await self.bot.database.set_application_staff_roles(
+                    inter.guild_id, selected["id"], recruiter_role.id, high_role.id,
+                )
+            except asyncpg.UniqueViolationError:
+                await inter.edit_original_response(
+                    "Одна из ролей уже используется для заявок другого сервера. Выберите отдельную роль."
+                )
+                return
+            except (asyncpg.PostgresError, ValueError, RuntimeError):
+                logging.exception("Could not configure application roles")
+                await inter.edit_original_response("Не удалось сохранить роли. Проверьте настройки сервера и повторите.")
+                return
+            failures = await self._sync_ticket_access(inter.guild_id)
+        archive = await application_log_channel(self.bot)
+        result = (
+            f"✅ **{selected['name']}**: рекрутёры — {recruiter_role.mention} (уровень 2), "
+            f"High — {high_role.mention} (уровень 4). Права существующих тикетов обновлены."
+        )
+        if failures:
+            result = result.replace("Права существующих тикетов обновлены.",
+                f"Не удалось обновить {failures} тикет(ов). Проверьте права бота и повторите команду.")
+        if archive is None:
+            result += "\n⚠️ Не удалось закрыть общий архив заявок. Проверьте права бота на этот канал."
+        await inter.edit_original_response(result)
+
+    @applications_roles.autocomplete("server")
+    async def applications_roles_server_autocomplete(
+        self, inter: disnake.ApplicationCommandInteraction, query: str
+    ) -> list[str]:
+        if inter.guild_id not in GUILD_IDS or inter.guild is None:
+            return []
+        try:
+            servers = await self.bot.database.get_game_servers(inter.guild_id)
+        except (asyncpg.PostgresError, OSError, RuntimeError):
+            logging.exception("Could not load application servers for autocomplete")
+            return []
+        query = query.strip().casefold()
+        return [
+            row["name"] for row in servers
+            if row["role_id"] is not None
+            and inter.guild.get_role(row["role_id"]) is not None
+            and query in row["name"].casefold()
+        ][:25]
+
+    @applications.sub_command(name="roles_show", description="Показать доступ к заявкам по серверам (уровень 5)")
+    async def applications_roles_show(self, inter: disnake.ApplicationCommandInteraction) -> None:
+        if inter.guild_id not in GUILD_IDS:
+            return
+        rows = await self.bot.database.get_application_staff_roles(inter.guild_id)
+        servers = await self.bot.database.get_game_servers(inter.guild_id)
+        lines = []
+        for server in servers:
+            labels = [
+                f"{'Рекрутёры' if row['access_level'] == 2 else 'High'}: <@&{row['role_id']}>"
+                for row in rows if row["server_id"] == server["id"]
+            ]
+            lines.append(f"**{server['name']}** — " + (", ".join(labels) or "роли не настроены"))
+        await inter.response.send_message("\n".join(lines) or "Игровые серверы не настроены.", ephemeral=True)
+
     @applications.sub_command(name="block", description="Заблокировать подачу заявок пользователю (уровень 5)")
     async def applications_block(
         self,
@@ -743,6 +936,39 @@ class ApplicationsCog(commands.Cog):
             color=disnake.Color.green(),
         )
 
+    @applications.sub_command(
+        name="reset_cooldown",
+        description="Сбросить кулдаун подачи заявки пользователю (уровень 5)",
+    )
+    async def applications_reset_cooldown(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        user: disnake.User = commands.Param(description="Пользователь, которому сбросить кулдаун заявки"),
+    ) -> None:
+        if inter.guild_id not in GUILD_IDS:
+            return
+        await inter.response.defer(ephemeral=True)
+        lock = self.application_submission_locks.setdefault(
+            (inter.guild_id, user.id), asyncio.Lock()
+        )
+        async with lock:
+            try:
+                await self.bot.database.reset_application_cooldown(inter.guild_id, user.id)
+            except (asyncpg.PostgresError, OSError, RuntimeError):
+                logging.exception("Could not reset application cooldown")
+                await inter.edit_original_response("Не удалось сбросить кулдаун. Попробуйте позже.")
+                return
+        await inter.edit_original_response(
+            f"✅ Кулдаун подачи заявки для {user.mention} сброшен."
+        )
+        await send_admin_log(
+            self.bot,
+            channel_id=APPLICATION_LOG_CHANNEL_ID,
+            title="⏱️ Кулдаун подачи заявки сброшен",
+            description=f"Пользователь: {user.mention} (`{user.id}`)\nАдминистратор: {inter.author.mention}",
+            color=disnake.Color.green(),
+        )
+
     @commands.Cog.listener("on_dropdown")
     async def application_server_select(
         self, inter: disnake.MessageInteraction
@@ -767,7 +993,7 @@ class ApplicationsCog(commands.Cog):
             and inter.guild.get_role(row["role_id"]) is not None
         ]
         chosen_servers = [row for row in server_rows if row["id"] in server_ids]
-        if family is None or not chosen_servers or len(chosen_servers) != len(server_ids):
+        if family is None or family["name"] != FAMILY_NAME or len(chosen_servers) != 1 or len(server_ids) != 1:
             await inter.response.send_message("Некорректный или устаревший выбор.", ephemeral=True)
             return
 
@@ -797,10 +1023,15 @@ class ApplicationsCog(commands.Cog):
     ) -> None:
         if inter.guild_id is None or inter.guild is None:
             return
+        if panel_channel.id == APPLICATION_LOG_CHANNEL_ID:
+            await inter.response.send_message(
+                "Выберите другой канал: общий архив заявок доступен только администраторам.", ephemeral=True
+            )
+            return
         family_role = inter.guild.get_role(FAMILY_MEMBER_ROLE_ID)
         if family_role is None:
             await inter.response.send_message(
-                "Роль объединённой семьи не найдена на сервере.", ephemeral=True
+                "Роль семьи INTERPOLOV не найдена на сервере.", ephemeral=True
             )
             return
         await inter.response.defer(ephemeral=True)
@@ -840,8 +1071,8 @@ class ApplicationsCog(commands.Cog):
                 f"Администратор: {inter.author.mention}\n"
                 f"Канал: {panel_channel.mention}\n"
                 f"Категория: **{ticket_category.name}**\n"
-                "Доступ к тикетам: **уровни 2–4**\n"
-                f"Объединённая семья: {family_role.mention}"
+                "Доступ к тикетам: **рекрутёры и High выбранного сервера**\n"
+                f"Семья: {family_role.mention}"
             ),
             color=disnake.Color.green(),
         )
@@ -862,7 +1093,7 @@ class ApplicationsCog(commands.Cog):
             ]
             if family is None or not server_rows:
                 await inter.response.send_message(
-                    "Список семей или игровых серверов пуст/устарел.", ephemeral=True
+                    "Семья INTERPOLOV или игровые серверы ещё не настроены.", ephemeral=True
                 )
                 return
             config = await self.bot.database.get_application_config(inter.guild_id)
@@ -873,7 +1104,7 @@ class ApplicationsCog(commands.Cog):
                 await inter.response.send_message("У вас уже есть открытая заявка.", ephemeral=True)
                 return
             await inter.response.send_message(
-                "Выберите один или несколько серверов, на которых вы играете:",
+                "Выберите сервер, на который подаёте заявку:",
                 components=server_select(family["id"], server_rows),
                 ephemeral=True,
             )
@@ -896,18 +1127,33 @@ class ApplicationsCog(commands.Cog):
 
         await inter.response.defer()
         config = await self.bot.database.get_application_config(inter.guild_id)
-        if await member_access_level(self.bot, inter.author) < 2:
+        current_application = await self.bot.database.get_application(application_id)
+        if (
+            current_application is None
+            or current_application["guild_id"] != inter.guild_id
+            or current_application["ticket_channel_id"] != inter.channel_id
+            or not await can_review_application(self.bot, inter.author, current_application)
+        ):
             await inter.followup.send(
-                "Только рекрутёры могут обрабатывать заявки.", ephemeral=True
+                "Обрабатывать заявку могут только рекрутёры и High её сервера.", ephemeral=True
             )
             return
 
         if status == "delete":
             application = await self.bot.database.get_application(application_id)
-            if application is None or not application["transcript_path"]:
+            if application is None or application["status"] not in {"accepted", "declined"}:
                 await inter.followup.send(
-                    "Удаление недоступно: транскрипт ещё не сохранён.", ephemeral=True
+                    "Удаление недоступно: заявка ещё не рассмотрена.", ephemeral=True
                 )
+                return
+            if not isinstance(inter.channel, disnake.TextChannel):
+                return
+            # Capture messages sent after the decision before removing the ticket.
+            if not await self._finalize_ticket(
+                inter.channel, application, STATUS_NAMES[application["status"]],
+                "✅ HTML-транскрипт отправлен в журнал. Теперь тикет можно удалить.",
+            ):
+                await inter.followup.send("Удаление отменено: архивирование не завершено.", ephemeral=True)
                 return
             await inter.followup.send(
                 "🗑️ Тикет будет удалён через секунду.", ephemeral=True
@@ -933,7 +1179,7 @@ class ApplicationsCog(commands.Cog):
         if current_application["status"] in {"accepted", "declined"}:
             await self._sync_application_message(inter.message, current_application)
             if (
-                not current_application["transcript_path"]
+                (not current_application["transcript_path"] or not current_application.get("transcript_log_message_id"))
                 and isinstance(inter.channel, disnake.TextChannel)
             ):
                 await self._finalize_ticket(

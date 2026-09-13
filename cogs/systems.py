@@ -15,11 +15,14 @@ from access_control import (
     command_access_level,
     member_access_level,
 )
-from config import BLACKLIST_CHANNEL_ID, DEVELOPER_USER_ID, FAMILY_NAME, GUILD_IDS
-from log_utils import send_admin_log
+from config import (
+    BLACKLIST_CHANNEL_ID, DEVELOPER_USER_ID, FAMILY_NAME, GUILD_IDS,
+    SECURITY_ROLE_RESTORE_WINDOW_HOURS,
+)
+from log_utils import send_admin_log, send_security_log
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 DEPARTMENT_NAMES = {
@@ -36,6 +39,7 @@ SECURITY_AUDIT_MAX_AGE_SECONDS = 30
 KICK_LIMIT = 5
 ROLE_REMOVAL_LIMIT = 10
 SECURITY_WINDOW = timedelta(minutes=60)
+SECURITY_ROLE_RESTORE_WINDOW = timedelta(hours=SECURITY_ROLE_RESTORE_WINDOW_HOURS)
 
 
 def normalize_static_id(value: str) -> str:
@@ -187,13 +191,15 @@ class HelpPaginator(disnake.ui.View):
 
 
 class SystemsCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
         self._security_locks: dict[int, asyncio.Lock] = {}
         self._processed_kick_entries: dict[int, datetime] = {}
         self._processed_role_update_entries: dict[int, datetime] = {}
         self._kick_penalties: dict[int, datetime] = {}
         self._role_removal_penalties: dict[int, datetime] = {}
+        self._processed_role_restoration_entries: dict[int, datetime] = {}
+        self._security_role_removals: dict[tuple[int, int], list[tuple[int, datetime]]] = {}
 
     async def find_security_audit_entry(
         self,
@@ -202,6 +208,7 @@ class SystemsCog(commands.Cog):
         target_id: int,
         *,
         ignored_entry_ids: set[int] | None = None,
+        added_role_ids: set[int] | None = None,
     ) -> disnake.AuditLogEntry | None:
         """Wait briefly for Discord to publish and then find an exact audit entry."""
         for attempt in range(SECURITY_AUDIT_RETRIES):
@@ -215,6 +222,9 @@ class SystemsCog(commands.Cog):
                     if (
                         getattr(entry.target, "id", None) == target_id
                         and (ignored_entry_ids is None or entry.id not in ignored_entry_ids)
+                        and (added_role_ids is None or added_role_ids.intersection(
+                            role.id for role in getattr(entry.after, "roles", ())
+                        ))
                     ):
                         return entry
             except disnake.DiscordException:
@@ -279,11 +289,13 @@ class SystemsCog(commands.Cog):
         event_details: str,
         audit_reason: str,
     ) -> None:
+        if member.guild.id not in GUILD_IDS or self.is_current_bot(member):
+            return
         lock = self._security_locks.setdefault(member.id, asyncio.Lock())
         async with lock:
             exemption = await self.security_exemption_reason(member)
             if exemption is not None:
-                await send_admin_log(
+                await send_security_log(
                     self.bot,
                     title=f"🛡️ Защита: {event_name}",
                     description=(
@@ -297,7 +309,7 @@ class SystemsCog(commands.Cog):
 
             bot_member = member.guild.me
             if bot_member is None or not bot_member.guild_permissions.manage_roles:
-                await send_admin_log(
+                await send_security_log(
                     self.bot,
                     title=f"⚠️ Защита не смогла снять роли: {event_name}",
                     description=(
@@ -323,11 +335,12 @@ class SystemsCog(commands.Cog):
                         reason=audit_reason,
                         atomic=False,
                     )
+                    removed_at = disnake.utils.utcnow()
             except disnake.DiscordException as error:
                 logging.exception(
                     "Could not remove roles from security actor %s", member.id
                 )
-                await send_admin_log(
+                await send_security_log(
                     self.bot,
                     title=f"⚠️ Ошибка защиты: {event_name}",
                     description=(
@@ -339,7 +352,9 @@ class SystemsCog(commands.Cog):
                 )
                 return
 
-            await send_admin_log(
+            if removable_roles:
+                await self.record_security_role_removals(member, removable_roles, removed_at)
+            await send_security_log(
                 self.bot,
                 title=f"🚨 Защита: {event_name}",
                 description=(
@@ -348,6 +363,104 @@ class SystemsCog(commands.Cog):
                     f"Снятые роли: {self.security_role_list(removable_roles)}"
                 ),
                 color=disnake.Color.red(),
+            )
+
+    async def record_security_role_removals(
+        self, member: disnake.Member, roles: list[disnake.Role], removed_at: datetime
+    ) -> None:
+        # Populate the fallback before awaiting PostgreSQL, so a temporary DB
+        # failure does not disable protection for removals in this process.
+        cutoff = disnake.utils.utcnow() - SECURITY_ROLE_RESTORE_WINDOW - timedelta(
+            seconds=SECURITY_AUDIT_MAX_AGE_SECONDS + SECURITY_AUDIT_RETRIES
+        )
+        self._security_role_removals = {
+            key: recent for key, records in self._security_role_removals.items()
+            if (recent := [(role_id, timestamp) for role_id, timestamp in records if timestamp >= cutoff])
+        }
+        self._security_role_removals.setdefault((member.guild.id, member.id), []).extend(
+            (role.id, removed_at) for role in roles
+        )
+        try:
+            await self.bot.database.record_security_role_removals(
+                member.guild.id, member.id, [role.id for role in roles], removed_at,
+            )
+        except (asyncpg.PostgresError, OSError, RuntimeError):
+            logging.exception("Could not persist security role removals for member %s", member.id)
+            await send_security_log(
+                self.bot,
+                title="⚠️ Защита: не удалось сохранить снятие ролей",
+                description=(
+                    f"Пользователь: {member.mention} (`{member.id}`).\n"
+                    "Контроль возврата ролей работает в памяти, но эта запись не переживёт перезапуск."
+                ),
+            )
+
+    @commands.Cog.listener("on_member_update")
+    async def security_member_role_restore(
+        self, before: disnake.Member, after: disnake.Member
+    ) -> None:
+        if after.guild.id not in GUILD_IDS or self.is_current_bot(after):
+            return
+        added_ids = {role.id for role in after.roles} - {role.id for role in before.roles}
+        if not added_ids:
+            return
+        now = disnake.utils.utcnow()
+        cutoff = now - SECURITY_ROLE_RESTORE_WINDOW - timedelta(
+            seconds=SECURITY_AUDIT_MAX_AGE_SECONDS + SECURITY_AUDIT_RETRIES
+        )
+        # Wait for any in-flight punishment of the recipient to be recorded.
+        lock = self._security_locks.setdefault(after.id, asyncio.Lock())
+        async with lock:
+            removals = list(self._security_role_removals.get((after.guild.id, after.id), ()))
+            try:
+                removals.extend(
+                    (row["role_id"], row["removed_at"])
+                    for row in await self.bot.database.get_security_role_removals(
+                        after.guild.id, after.id, cutoff,
+                    )
+                )
+            except (asyncpg.PostgresError, OSError, RuntimeError):
+                logging.exception("Could not load security role removals for member %s", after.id)
+        remaining = added_ids & {role_id for role_id, timestamp in removals if timestamp >= cutoff}
+        if not remaining:
+            return
+        self._processed_role_restoration_entries = {
+            entry_id: timestamp for entry_id, timestamp in self._processed_role_restoration_entries.items()
+            if timestamp >= now - SECURITY_WINDOW
+        }
+        while remaining:
+            entry = await self.find_security_audit_entry(
+                after.guild, disnake.AuditLogAction.member_role_update, after.id,
+                ignored_entry_ids=set(self._processed_role_restoration_entries),
+                added_role_ids=remaining,
+            )
+            if entry is None:
+                return
+            matched_ids = remaining & {role.id for role in getattr(entry.after, "roles", ())}
+            if not matched_ids:
+                return
+            remaining -= matched_ids
+            if entry.id in self._processed_role_restoration_entries:
+                continue
+            self._processed_role_restoration_entries[entry.id] = entry.created_at
+            restored_ids = matched_ids & {
+                role_id for role_id, removed_at in removals
+                if removed_at <= entry.created_at < removed_at + SECURITY_ROLE_RESTORE_WINDOW
+            }
+            if not restored_ids:
+                continue
+            actor = await self.security_actor(after.guild, entry)
+            if actor is None or self.is_current_bot(actor):
+                continue
+            await self.remove_security_actor_roles(
+                actor,
+                event_name="возврат ролей после наказания защитой",
+                event_details=(
+                    f"Получатель ролей: {after.mention} (`{after.id}`).\n"
+                    f"Возвращённые роли: {', '.join(f'<@&{role_id}>' for role_id in sorted(restored_ids))}.\n"
+                    f"Роли сняты защитой менее {SECURITY_ROLE_RESTORE_WINDOW_HOURS} часов назад."
+                ),
+                audit_reason="Защита сервера: возврат ролей после наказания за подозрительные действия",
             )
 
     async def handle_security_deletion(
@@ -364,7 +477,7 @@ class SystemsCog(commands.Cog):
         entry = await self.find_security_audit_entry(guild, action, target_id)
         actor = await self.security_actor(guild, entry) if entry is not None else None
         if actor is None:
-            await send_admin_log(
+            await send_security_log(
                 self.bot,
                 title=f"⚠️ Защита: не найден виновник ({event_name})",
                 description=(
@@ -433,7 +546,7 @@ class SystemsCog(commands.Cog):
         actor = await self.security_actor(member.guild, entry) if entry else None
         if actor is None:
             ban_status = await self.ban_unauthorized_bot(member)
-            await send_admin_log(
+            await send_security_log(
                 self.bot,
                 title="⚠️ Защита: не найден пригласивший бота",
                 description=(
@@ -447,7 +560,7 @@ class SystemsCog(commands.Cog):
 
         exemption = self.bot_invite_exemption_reason(actor)
         if exemption is not None:
-            await send_admin_log(
+            await send_security_log(
                 self.bot,
                 title="🛡️ Разрешённое приглашение бота",
                 description=(
@@ -629,6 +742,7 @@ class SystemsCog(commands.Cog):
         await self.bot.database.remove_deleted_role_references(role.guild.id, role.id)
         applications_cog = self.bot.get_cog("ApplicationsCog")
         if applications_cog is not None:
+            await applications_cog.sync_ticket_access(role.guild.id)
             await applications_cog.refresh_application_panel(role.guild.id)
         logging.info("Removed configuration references to deleted role %s", role.id)
 
@@ -683,6 +797,18 @@ class SystemsCog(commands.Cog):
         if inter.guild_id is None:
             return
         row = await self.bot.database.delete_game_server(inter.guild_id, name.strip())
+        if row:
+            await inter.response.defer(ephemeral=True)
+            applications_cog = self.bot.get_cog("ApplicationsCog")
+            if applications_cog is not None:
+                failures = await applications_cog.sync_ticket_access(inter.guild_id)
+                if failures:
+                    await inter.edit_original_response(
+                        f"Сервер удалён, но права {failures} тикет(ов) обновить не удалось. Проверьте права бота."
+                    )
+                    return
+            await inter.edit_original_response(f"✅ Сервер **{row['name']}** удалён.")
+            return
         await inter.response.send_message(
             f"✅ Сервер **{row['name']}** удалён."
             if row else "Сервер с таким названием не найден.",
@@ -707,7 +833,7 @@ class SystemsCog(commands.Cog):
         ]
         await inter.response.send_message(
             "**Игровые серверы**\n" + ("\n".join(server_lines) or "—")
-            + f"\n\n**Объединённая семья {FAMILY_NAME}**\n"
+            + f"\n\n**Семья {FAMILY_NAME}**\n"
             + ("\n".join(family_lines) or "—"),
             ephemeral=True,
         )
@@ -790,7 +916,15 @@ class SystemsCog(commands.Cog):
         member: disnake.Member,
         entries,
     ) -> None:
+        if member.guild.id not in GUILD_IDS or self.is_current_bot(member):
+            return
+        lock = self._security_locks.setdefault(member.id, asyncio.Lock())
+        async with lock:
+            await self._punish_unauthorized_blacklist_deletion(member, entries)
+
+    async def _punish_unauthorized_blacklist_deletion(self, member: disnake.Member, entries) -> None:
         bot_member = member.guild.me
+        exemption = await self.security_exemption_reason(member)
         removable_roles = [
             role
             for role in member.roles
@@ -798,6 +932,7 @@ class SystemsCog(commands.Cog):
             and not role.managed
             and bot_member is not None
             and role < bot_member.top_role
+            and exemption is None
         ]
         removed_roles: list[disnake.Role] = []
         role_errors: list[str] = []
@@ -807,7 +942,9 @@ class SystemsCog(commands.Cog):
                     role,
                     reason="Несанкционированное удаление сообщения чёрного списка",
                 )
+                removed_at = disnake.utils.utcnow()
                 removed_roles.append(role)
+                await self.record_security_role_removals(member, [role], removed_at)
             except disnake.DiscordException as error:
                 logging.exception(
                     "Could not remove role %s after unauthorized blacklist deletion",
@@ -836,12 +973,14 @@ class SystemsCog(commands.Cog):
             if role_errors
             else ""
         )
+        if exemption is not None:
+            error_text += f"\nРоли не сняты: **{exemption}**."
         restored_ids = []
         for entry in entries:
             if await self.publish_blacklist_entry(entry, removed=False):
                 restored_ids.append(entry["id"])
         entry_ids = [entry["id"] for entry in entries]
-        await send_admin_log(
+        await send_security_log(
             self.bot,
             title="🚨 Несанкционированное удаление сообщения ЧС",
             description=(

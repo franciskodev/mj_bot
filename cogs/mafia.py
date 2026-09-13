@@ -15,7 +15,7 @@ from cogs.mafia_rooms import MafiaRooms
 from cogs.mafia_notifications import deliver_notifications
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 METRICS = {
@@ -161,7 +161,7 @@ def private_panel(game: dict, user_id: int) -> tuple[str, list]:
 
 
 class MafiaCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
         self._message_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         self._game_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()

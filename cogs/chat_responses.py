@@ -23,7 +23,7 @@ from config import (
 )
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 CHAT_INSTRUCTIONS = """
@@ -86,7 +86,7 @@ AGGRESSIVE_REWRITE_INSTRUCTIONS = """
 
 
 class ChatResponsesCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
         self.client = (
             AsyncOpenAI(
@@ -102,7 +102,7 @@ class ChatResponsesCog(commands.Cog):
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(15.0),
             follow_redirects=False,
-            headers={"User-Agent": "IntoleranceDiscordBot/1.0"},
+            headers={"User-Agent": "InterpolovDiscordBot/1.0"},
         )
         if self.client is None:
             logging.warning(

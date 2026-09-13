@@ -10,7 +10,7 @@ from config import BROADCAST_GUILD_IDS, BROADCAST_ROLE_IDS, GUILD_ID, TARGET_ROL
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 @dataclass
@@ -84,7 +84,7 @@ def split_report(text: str, limit: int = 3500) -> list[str]:
 
 
 class BroadcastControlView(disnake.ui.View):
-    def __init__(self, session: BroadcastSession, bot: "IntoleranceBot") -> None:
+    def __init__(self, session: BroadcastSession, bot: "InterpolovBot") -> None:
         super().__init__(timeout=None)
         self.session = session
         self.bot = bot
@@ -149,7 +149,7 @@ class BroadcastControlView(disnake.ui.View):
 
 
 class BroadcastCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
         self.current_session: BroadcastSession | None = None
         self.broadcast_task: asyncio.Task[None] | None = None

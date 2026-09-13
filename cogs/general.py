@@ -6,11 +6,11 @@ from disnake.ext import commands
 from config import GUILD_IDS
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 class GeneralCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
 
     @commands.slash_command(name="ping", description="Check bot latency", guild_ids=GUILD_IDS)

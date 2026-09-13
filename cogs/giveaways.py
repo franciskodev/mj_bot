@@ -11,7 +11,7 @@ from disnake.ext import commands, tasks
 from config import GIVEAWAY_CHANNEL_ID, GUILD_ID, GUILD_IDS
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 CLAIM_CHOICES = {
@@ -59,7 +59,7 @@ def giveaway_components(giveaway_id: int, status: str) -> list[disnake.ui.Button
 
 
 class GiveawaysCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
         self._giveaway_locks: dict[int, asyncio.Lock] = {}
         self.finish_giveaways.start()
@@ -200,7 +200,7 @@ class GiveawaysCog(commands.Cog):
             )
 
         embed.set_footer(
-            text=f"INTERPOLOV & INTOLERANCE • {STATUS_NAMES[status]}"
+            text=f"INTERPOLOV • {STATUS_NAMES[status]}"
         )
         return embed
 

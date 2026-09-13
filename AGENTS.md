@@ -22,7 +22,7 @@
   during a game, preserve access level 6, and restore the roles afterward.
 - Protection against channel deletion, role deletion, and role removal must ignore
   actions performed by this bot itself.
-- Do not remove DM forwarding or the shared `INTERPOLOV & INTOLERANCE` recruitment
+- Do not remove DM forwarding or the `INTERPOLOV` recruitment
   system unless explicitly requested.
 
 ## Security and Configuration

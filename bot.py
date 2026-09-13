@@ -20,9 +20,11 @@ from cogs.direct_messages import DirectMessagesCog
 from cogs.general import GeneralCog
 from cogs.giveaways import GiveawaysCog
 from cogs.leave import LeaveCog
+from cogs.log_protection import LogProtectionCog
 from cogs.mafia import MafiaCog
 from cogs.meetings import MeetingsCog
 from cogs.management import ManagementCog
+from cogs.promotions import PromotionsCog
 from cogs.server_tags import ServerTagsCog
 from cogs.systems import SystemsCog
 from cogs.users import UsersCog
@@ -31,11 +33,12 @@ from config import BROADCAST_GUILD_ID, GUILD_ID
 from database import Database
 
 
-class IntoleranceBot(commands.InteractionBot):
+class InterpolovBot(commands.InteractionBot):
     def __init__(self) -> None:
         intents = disnake.Intents.default()
         intents.message_content = True
         intents.members = True
+        intents.moderation = True
 
         super().__init__(intents=intents)
 
@@ -60,10 +63,12 @@ class IntoleranceBot(commands.InteractionBot):
         self.add_cog(MafiaCog(self))
         self.add_cog(MeetingsCog(self))
         self.add_cog(ManagementCog(self))
+        self.add_cog(PromotionsCog(self))
         self.add_cog(ServerTagsCog(self))
         self.add_cog(WarningsCog(self))
         self.add_cog(ApplicationsCog(self))
         self.add_cog(SystemsCog(self))
+        self.add_cog(LogProtectionCog(self))
 
     def request_fatal_shutdown(self, error: BaseException) -> None:
         if self.fatal_error is None:

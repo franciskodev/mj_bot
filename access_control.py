@@ -4,10 +4,11 @@ from typing import TYPE_CHECKING
 
 import disnake
 
-from config import DEVELOPER_USER_ID, FAMILY_MEMBER_ROLE_ID, GUILD_ID, TARGET_ROLE_IDS
+from config import DEVELOPER_USER_ID, FAMILY_MEMBER_ROLE_ID, FAMILY_RANK_ROLE_IDS, GUILD_ID, TARGET_ROLE_IDS
+from cogs.family_ranks import family_rank_from_roles
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 ACCESS_LEVEL_NAMES = {
@@ -53,6 +54,7 @@ DEFAULT_COMMAND_LEVELS = {
     "applications setup": 5,
     "applications block": 5,
     "applications unblock": 5,
+    "applications reset_cooldown": 5,
     "blacklist add": 5,
     "access command": 5,
     "access role_add": 5,
@@ -67,9 +69,12 @@ DEFAULT_COMMAND_LEVELS = {
 
 # Эти команды нельзя ослабить пользовательской настройкой.
 PROTECTED_COMMAND_LEVELS = {
+    "applications roles": 5,
+    "applications roles_show": 5,
     "mafia create": 5,
     "applications block": 5,
     "applications unblock": 5,
+    "applications reset_cooldown": 5,
     "режим_проверки": 4,
     "blacklist add": 5,
     "giveaway end": 5,
@@ -101,7 +106,7 @@ def interaction_command_name(inter: disnake.ApplicationCommandInteraction) -> st
 
 
 async def command_access_level(
-    bot: "IntoleranceBot", guild_id: int, command_name: str
+    bot: "InterpolovBot", guild_id: int, command_name: str
 ) -> int:
     if command_name in PROTECTED_COMMAND_LEVELS:
         return PROTECTED_COMMAND_LEVELS[command_name]
@@ -111,7 +116,7 @@ async def command_access_level(
 
 
 async def member_access_level(
-    bot: "IntoleranceBot", member: disnake.Member
+    bot: "InterpolovBot", member: disnake.Member
 ) -> int:
     if member.id == DEVELOPER_USER_ID:
         return 6
@@ -147,7 +152,7 @@ async def member_access_level(
     return level
 
 
-async def family_role_ids(bot: "IntoleranceBot", guild_id: int) -> set[int]:
+async def family_role_ids(bot: "InterpolovBot", guild_id: int) -> set[int]:
     if guild_id != GUILD_ID:
         return set()
     return {FAMILY_MEMBER_ROLE_ID, *TARGET_ROLE_IDS} | {
@@ -156,5 +161,56 @@ async def family_role_ids(bot: "IntoleranceBot", guild_id: int) -> set[int]:
     }
 
 
-async def has_family_role(bot: "IntoleranceBot", member: disnake.Member) -> bool:
+async def application_staff_role_ids(
+    bot: "InterpolovBot", guild_id: int, game_server: str
+) -> set[int]:
+    # Legacy applications with several servers stay visible only to admins and
+    # the applicant: granting the union would disclose them across teams.
+    return {
+        row["role_id"]
+        for row in await bot.database.get_application_staff_roles(guild_id)
+        if row["server_name"] == game_server
+    }
+
+
+async def can_review_application(bot: "InterpolovBot", member: disnake.Member, application) -> bool:
+    if member.guild.id != application["guild_id"]:
+        return False
+    if member.id == DEVELOPER_USER_ID or member.guild_permissions.administrator:
+        return True
+    return (
+        await member_access_level(bot, member) >= 2
+        and bool({role.id for role in member.roles} & await application_staff_role_ids(
+            bot, member.guild.id, application["game_server"]
+        ))
+    )
+
+
+async def has_family_role(bot: "InterpolovBot", member: disnake.Member) -> bool:
     return bool({role.id for role in member.roles} & await family_role_ids(bot, member.guild.id))
+
+
+async def promotion_approval_error(
+    bot: "InterpolovBot", reviewer: disnake.Member,
+    applicant: disnake.Member, target_rank: str,
+) -> str | None:
+    if reviewer.guild.id != GUILD_ID or applicant.guild.id != GUILD_ID:
+        return "Повышения доступны только на основном сервере."
+    if reviewer.id == applicant.id:
+        return "Нельзя одобрить собственную заявку."
+    if await member_access_level(bot, reviewer) < 4:
+        return "Рассматривать повышение можно с уровня допуска 4."
+    if applicant.id == DEVELOPER_USER_ID:
+        return "Автоматическое изменение ролей разработчика (уровень 6) запрещено."
+    if target_rank not in FAMILY_RANK_ROLE_IDS:
+        return "Неизвестный ранг."
+    reviewer_rank = family_rank_from_roles({role.id for role in reviewer.roles})
+    ranks = list(FAMILY_RANK_ROLE_IDS)
+    if ranks.index(target_rank) >= ranks.index(reviewer_rank):
+        return "Можно выдать только ранг строго ниже своего семейного ранга."
+    target_role = reviewer.guild.get_role(FAMILY_RANK_ROLE_IDS[target_rank])
+    if target_role is None:
+        return "Discord-роль выбранного ранга не найдена."
+    if target_role >= reviewer.top_role or applicant.top_role >= reviewer.top_role:
+        return "Роль повышения и высшая роль заявителя должны быть строго ниже вашей Discord-роли."
+    return None

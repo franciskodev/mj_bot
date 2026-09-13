@@ -8,11 +8,11 @@ from config import GUILD_IDS, WARNING_LOG_CHANNEL_ID
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 async def notify_warning(
-    bot: "IntoleranceBot",
+    bot: "InterpolovBot",
     member: disnake.Member,
     administrator: disnake.Member | disnake.User,
     reason: str,
@@ -79,7 +79,7 @@ async def notify_warning(
         inline=True,
     )
     log_embed.add_field(name="Причина", value=reason, inline=False)
-    log_embed.set_footer(text="INTERPOLOV & INTOLERANCE • Журнал выговоров")
+    log_embed.set_footer(text="INTERPOLOV • Журнал выговоров")
     try:
         await channel.send(embed=log_embed)
     except disnake.DiscordException:
@@ -88,7 +88,7 @@ async def notify_warning(
 
 
 class WarningsCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
 
     @commands.slash_command(

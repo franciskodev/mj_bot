@@ -298,6 +298,91 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(game_id, [r['id'] for r in await reopened.pending_mafia_games(1)])
         self.assertEqual(await self.db.pool.fetchval('SELECT COUNT(*) FROM mafia_results'), 6)
 
+    async def test_application_roles_migration_isolation_and_replacement(self):
+        from unittest.mock import patch
+        from config import FAMILY_NAME, GUILD_ID
+
+        configured = Database()
+        dsn = f"postgresql:///postgres?host={self.root}&port=55439&user={getpass.getuser()}"
+        with patch('database.DATABASE_URL', dsn):
+            await configured.connect()
+            try:
+                servers = {row['name']: row for row in await configured.get_game_servers(GUILD_ID)}
+                seattle, orlando = servers['Seattle']['id'], servers['Orlando']['id']
+                await configured.set_application_staff_roles(GUILD_ID, seattle, 101, 102)
+                await configured.set_application_staff_roles(GUILD_ID, orlando, 201, 202)
+                self.assertEqual(await configured.get_highest_role_access_level(GUILD_ID, {101}), 2)
+                self.assertEqual(await configured.get_highest_role_access_level(GUILD_ID, {102}), 4)
+                self.assertEqual(await configured.get_highest_role_access_level(999, {102}), 0)
+                with self.assertRaises(asyncpg.UniqueViolationError):
+                    await configured.set_application_staff_roles(GUILD_ID, orlando, 301, 102)
+                rows = await configured.get_application_staff_roles(GUILD_ID)
+                self.assertEqual({r['role_id'] for r in rows if r['server_id'] == orlando}, {201, 202})
+                await configured.set_application_staff_roles(GUILD_ID, seattle, 103, 104)
+                self.assertEqual(await configured.get_highest_role_access_level(GUILD_ID, {101, 102}), 0)
+                self.assertEqual(await configured.get_highest_role_access_level(GUILD_ID, {104}), 4)
+                await configured.remove_deleted_role_references(GUILD_ID, 103)
+                self.assertEqual(await configured.get_highest_role_access_level(GUILD_ID, {103}), 0)
+                await configured.delete_game_server(GUILD_ID, 'Orlando')
+                self.assertEqual(await configured.get_highest_role_access_level(GUILD_ID, {201, 202}), 0)
+                await configured.pool.execute(
+                    "UPDATE families SET name='Legacy family' WHERE guild_id=$1 AND active=TRUE", GUILD_ID)
+                application = await configured.create_application(
+                    GUILD_ID, 'Legacy family', 'Seattle', 1, 'candidate', 'nickname', '123', 20, 'goal', 'https://example.com')
+            finally:
+                await configured.close()
+            # Repeated startup migrates old family data without losing role settings.
+            await configured.connect()
+            try:
+                self.assertEqual([r['name'] for r in await configured.get_families(GUILD_ID)], [FAMILY_NAME])
+                self.assertEqual((await configured.get_application(application['id']))['family_name'], FAMILY_NAME)
+                self.assertEqual(await configured.get_highest_role_access_level(GUILD_ID, {104}), 4)
+            finally:
+                await configured.close()
+
+    async def test_security_role_history_persists_with_time_and_guild_isolation(self):
+        from datetime import timedelta
+
+        source = (Path(__file__).resolve().parents[1] / 'database.py').read_text()
+        schema = source.split('CREATE TABLE IF NOT EXISTS security_role_removals (', 1)[1].split(
+            'CREATE TABLE IF NOT EXISTS command_access_levels (', 1)[0]
+        await self.db.pool.execute('CREATE TABLE IF NOT EXISTS security_role_removals (' + schema)
+        await self.db.pool.execute('TRUNCATE security_role_removals')
+        now = await self.db.pool.fetchval('SELECT NOW()')
+        recent = now - timedelta(hours=1)
+        await self.db.record_security_role_removals(1, 2, [10, 11], recent)
+        await self.db.record_security_role_removals(1, 2, [10], recent)
+        await self.db.record_security_role_removals(1, 2, [10], now)
+        await self.db.record_security_role_removals(1, 2, [12], now - timedelta(hours=4))
+        await self.db.record_security_role_removals(2, 2, [13], recent)
+        await self.db.record_security_role_removals(1, 3, [14], recent)
+        reopened = Database()
+        reopened.pool = await asyncpg.create_pool(
+            host=str(self.root), port=55439, user=getpass.getuser(), database='postgres', min_size=1, max_size=1)
+        try:
+            records = await reopened.get_security_role_removals(1, 2, now - timedelta(hours=3))
+            self.assertEqual({(r['role_id'], r['removed_at']) for r in records}, {(10, recent), (11, recent), (10, now)})
+            self.assertEqual(len(records), 3)
+        finally:
+            await reopened.pool.close()
+
+    async def test_protected_log_message_index_scope_duplicates_and_retention(self):
+        source = (Path(__file__).resolve().parents[1] / 'database.py').read_text()
+        schema = source.split('CREATE TABLE IF NOT EXISTS protected_log_messages (', 1)[1].split(
+            'CREATE TABLE IF NOT EXISTS security_role_removals (', 1)[0]
+        await self.db.pool.execute('CREATE TABLE IF NOT EXISTS protected_log_messages (' + schema)
+        await self.db.pool.execute('TRUNCATE protected_log_messages')
+        await self.db.record_protected_log_messages(1, 2, [41, 42, 43])
+        await self.db.record_protected_log_messages(1, 2, [42])
+        await self.db.record_protected_log_messages(2, 2, [44])
+        await self.db.record_protected_log_messages(1, 3, [45])
+        reopened = Database()
+        reopened.pool = self.db.pool
+        self.assertEqual(await reopened.get_protected_log_message_ids(1, 2, {41, 42, 44, 45}), {41, 42})
+        self.assertEqual(await reopened.get_protected_log_message_ids(1, 2, set()), set())
+        await self.db.prune_protected_log_messages(42)
+        self.assertEqual(await reopened.get_protected_log_message_ids(1, 2, {41, 42, 43}), {42, 43})
+
 
 if __name__ == '__main__':
     unittest.main()

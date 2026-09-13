@@ -11,7 +11,7 @@ from config import FAMILY_NAME, GUILD_ID, GUILD_IDS, TARGET_ROLE_IDS
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 STATUS_COLORS = {
@@ -96,6 +96,11 @@ def profile_embed(
     embed.add_field(name="🎮 Игровой ник", value=profile["game_nickname"] or "—", inline=True)
     embed.add_field(name="🌐 Сервер", value=profile["server_name"] or "—", inline=True)
     embed.add_field(name="🤝 Семья", value=profile["family_name"] or "—", inline=True)
+    embed.add_field(name="🏅 Ранг в семье", value=profile["family_rank"], inline=True)
+    embed.add_field(
+        name="💼 Должности", value=", ".join(profile["recruitment_positions"]) or "Нет",
+        inline=True,
+    )
     embed.add_field(name="📌 Статус", value=status, inline=True)
     if warning_count is not None:
         embed.add_field(
@@ -122,14 +127,14 @@ def profile_embed(
         value=format_date(profile["guild_joined_at"]),
         inline=False,
     )
-    embed.set_footer(text="INTERPOLOV & INTOLERANCE • Профиль участника")
+    embed.set_footer(text="INTERPOLOV • Профиль участника")
     return embed
 
 
 class ServerSelect(disnake.ui.StringSelect):
     def __init__(
         self,
-        bot: "IntoleranceBot",
+        bot: "InterpolovBot",
         owner: disnake.Member,
         current_servers: str | None,
         server_rows,
@@ -201,7 +206,7 @@ class ServerSelect(disnake.ui.StringSelect):
 class UserServerView(disnake.ui.View):
     def __init__(
         self,
-        bot: "IntoleranceBot",
+        bot: "InterpolovBot",
         owner: disnake.Member,
         current_servers: str | None,
         server_rows,
@@ -212,12 +217,28 @@ class UserServerView(disnake.ui.View):
 
 
 class UsersCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
         self.sync_profile_servers_from_roles.start()
 
     def cog_unload(self) -> None:
         self.sync_profile_servers_from_roles.cancel()
+
+    async def sync_family_profile(self, member: disnake.Member) -> None:
+        try:
+            await self.bot.database.sync_user_family_roles(member)
+        except (asyncpg.PostgresError, OSError, RuntimeError):
+            logging.exception("Could not synchronize family rank for member %s", member.id)
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        for profile in await self.bot.database.get_active_users():
+            member = guild.get_member(profile["discord_id"])
+            if member is not None and not member.bot:
+                await self.sync_family_profile(member)
 
     @commands.Cog.listener()
     async def on_member_update(
@@ -228,6 +249,8 @@ class UsersCog(commands.Cog):
         if after.guild.id != GUILD_ID or after.bot:
             return
 
+        if {role.id for role in before.roles} != {role.id for role in after.roles}:
+            await self.sync_family_profile(after)
         server_rows = await self.bot.database.get_game_servers(after.guild.id)
         server_role_ids = {row["role_id"] for row in server_rows if row["role_id"] is not None}
         before_server_roles = {role.id for role in before.roles} & server_role_ids
@@ -257,6 +280,7 @@ class UsersCog(commands.Cog):
             if member is None or member.bot:
                 continue
 
+            await self.sync_family_profile(member)
             servers = servers_from_roles(member, server_rows)
             server_name = ", ".join(servers)
             if selected_servers(profile["server_name"], valid_server_names) != set(servers):
@@ -291,7 +315,7 @@ class UsersCog(commands.Cog):
                 color=disnake.Color.gold(),
                 timestamp=disnake.utils.utcnow(),
             )
-            embed.set_footer(text="INTERPOLOV & INTOLERANCE • Настройка профиля")
+            embed.set_footer(text="INTERPOLOV • Настройка профиля")
             delivered = True
             try:
                 await member.send(embed=embed)
@@ -314,6 +338,8 @@ class UsersCog(commands.Cog):
         guild_ids=GUILD_IDS,
     )
     async def myinfo(self, inter: disnake.ApplicationCommandInteraction) -> None:
+        if isinstance(inter.author, disnake.Member):
+            await self.sync_family_profile(inter.author)
         profile = await self.bot.database.get_user(inter.author.id)
         if profile is None:
             embed = disnake.Embed(
@@ -392,7 +418,7 @@ class UsersCog(commands.Cog):
         )
         if family_row is None or family_row["role_id"] is None:
             await inter.response.send_message(
-                "Роль объединённой семьи не настроена. Используйте `/applications setup`.",
+                "Роль семьи INTERPOLOV не настроена. Используйте `/applications setup`.",
                 ephemeral=True,
             )
             return
@@ -502,6 +528,7 @@ class UsersCog(commands.Cog):
         inter: disnake.ApplicationCommandInteraction,
         member: disnake.Member = commands.Param(description="Участник Discord"),
     ) -> None:
+        await self.sync_family_profile(member)
         profile = await self.bot.database.get_user(member.id)
         if profile is None:
             await inter.response.send_message("Пользователь отсутствует в базе.", ephemeral=True)

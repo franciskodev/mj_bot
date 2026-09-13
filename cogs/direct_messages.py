@@ -10,7 +10,7 @@ from disnake.ext import commands
 from config import FORWARD_CHANNEL_ID, GUILD_ID
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 DM_TIMEOUT_DURATION = timedelta(minutes=10)
@@ -39,7 +39,7 @@ def contains_dm_trigger_word(content: str) -> bool:
 
 
 class DirectMessagesCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
 
     @commands.Cog.listener()

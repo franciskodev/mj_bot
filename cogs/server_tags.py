@@ -10,14 +10,14 @@ from log_utils import send_admin_log
 from dm_notifications import send_dm_notification
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 REQUIRED_SERVER_TAG = "INRP"
 
 
 class ServerTagsCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
         self.check_server_tags.start()
 
@@ -68,7 +68,7 @@ class ServerTagsCog(commands.Cog):
             value="Discord API не вернул данные о теге. Уведомление не отправлялось.",
             inline=False,
         )
-        embed.set_footer(text="INTERPOLOV & INTOLERANCE • Журнал серверных тегов")
+        embed.set_footer(text="INTERPOLOV • Журнал серверных тегов")
         await self.send_tag_log(embed)
 
     async def log_tag_notification(
@@ -136,7 +136,7 @@ class ServerTagsCog(commands.Cog):
             value=delivery_reason.capitalize(),
             inline=False,
         )
-        embed.set_footer(text="INTERPOLOV & INTOLERANCE • Журнал серверных тегов")
+        embed.set_footer(text="INTERPOLOV • Журнал серверных тегов")
         await self.send_tag_log(embed)
 
     @tasks.loop(hours=1)
@@ -190,7 +190,7 @@ class ServerTagsCog(commands.Cog):
                     timestamp=disnake.utils.utcnow(),
                 )
                 embed.set_footer(
-                    text="INTERPOLOV & INTOLERANCE • Напоминание о теге"
+                    text="INTERPOLOV • Напоминание о теге"
                 )
                 delivery = await send_dm_notification(
                     self.bot,
@@ -232,7 +232,7 @@ class ServerTagsCog(commands.Cog):
                 timestamp=disnake.utils.utcnow(),
             )
             summary_embed.set_footer(
-                text="INTERPOLOV & INTOLERANCE • Журнал серверных тегов"
+                text="INTERPOLOV • Журнал серверных тегов"
             )
             await self.send_tag_log(summary_embed)
             await send_admin_log(

@@ -4,11 +4,19 @@ from typing import TYPE_CHECKING
 import disnake
 from disnake.ext import commands, tasks
 
-from config import GUILD_ID, GUILD_IDS, LEAVE_ROLE_ID, MANAGEMENT_LOG_CHANNEL_ID, TARGET_ROLE_IDS
+from access_control import member_access_level
+from config import (
+    GUILD_ID,
+    GUILD_IDS,
+    HIGH_FAMQ_ROLE_ID,
+    LEAVE_ROLE_ID,
+    MANAGEMENT_LOG_CHANNEL_ID,
+    TARGET_ROLE_IDS,
+)
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 class LeaveRequestModal(disnake.ui.Modal):
@@ -67,7 +75,7 @@ class LeaveRequestModal(disnake.ui.Modal):
 
 
 class LeaveCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
         self.sync_leave_roles.start()
 
@@ -137,6 +145,8 @@ class LeaveCog(commands.Cog):
         self,
         inter: disnake.ApplicationCommandInteraction | disnake.ModalInteraction,
     ) -> str | None:
+        if inter.guild_id != GUILD_ID:
+            return "Заявки на отпуск доступны только на основном сервере."
         family_role_ids = set(TARGET_ROLE_IDS)
         family_role_ids.update(
             row["role_id"] for row in await self.bot.database.get_families(inter.guild_id)
@@ -159,6 +169,24 @@ class LeaveCog(commands.Cog):
             return "У вас уже есть запрос на рассмотрении."
         return None
 
+    async def leave_notification_role_ids(
+        self, guild: disnake.Guild, server_name: str | None
+    ) -> list[int]:
+        servers = {
+            name.strip().casefold() for name in (server_name or "").split(",")
+            if name.strip() and name.strip() not in {"-", "—"}
+        }
+        if not servers:
+            return [HIGH_FAMQ_ROLE_ID]
+        staff_roles = await self.bot.database.get_application_staff_roles(guild.id)
+        role_ids = {
+            row["role_id"] for row in staff_roles
+            if row["access_level"] == 4
+            and row["server_name"].strip().casefold() in servers
+            and guild.get_role(row["role_id"]) is not None
+        }
+        return sorted(role_ids) or [HIGH_FAMQ_ROLE_ID]
+
     async def submit_leave_request(
         self,
         inter: disnake.ModalInteraction,
@@ -173,6 +201,9 @@ class LeaveCog(commands.Cog):
 
         profile = await self.bot.database.get_user(inter.author.id)
         await inter.response.defer(ephemeral=True)
+        notification_role_ids = await self.leave_notification_role_ids(
+            inter.guild, profile["server_name"]
+        )
         request = await self.bot.database.create_leave_request(inter.author.id, reason, days)
         channel = self.bot.get_channel(MANAGEMENT_LOG_CHANNEL_ID)
         if channel is None:
@@ -195,12 +226,22 @@ class LeaveCog(commands.Cog):
         embed.add_field(name="📝 Причина", value=reason, inline=False)
         embed.add_field(name="🔗 Доказательства", value=evidence or "Не указаны", inline=False)
         embed.add_field(name="🆔 Discord ID", value=f"`{inter.author.id}`", inline=True)
-        embed.set_footer(text=f"INTERPOLOV & INTOLERANCE • Заявка #{request['id']}")
+        embed.set_footer(text=f"INTERPOLOV • Заявка #{request['id']}")
         components = [
             disnake.ui.Button(label="Одобрить", emoji="✅", style=disnake.ButtonStyle.success, custom_id=f"leave:approved:{request['id']}"),
             disnake.ui.Button(label="Отклонить", emoji="✖️", style=disnake.ButtonStyle.danger, custom_id=f"leave:declined:{request['id']}"),
         ]
-        message = await channel.send(embed=embed, components=components)
+        message = await channel.send(
+            content=" ".join(f"<@&{role_id}>" for role_id in notification_role_ids),
+            embed=embed,
+            components=components,
+            allowed_mentions=disnake.AllowedMentions(
+                everyone=False,
+                users=False,
+                roles=[disnake.Object(id=role_id) for role_id in notification_role_ids],
+                replied_user=False,
+            ),
+        )
         await self.bot.database.set_leave_log_message(request["id"], message.id)
         await inter.edit_original_response(
             f"✅ Заявка **#{request['id']}** отправлена администрации."
@@ -208,16 +249,26 @@ class LeaveCog(commands.Cog):
 
     @commands.Cog.listener("on_button_click")
     async def review_button(self, inter: disnake.MessageInteraction) -> None:
-        custom_id = inter.component.custom_id
+        custom_id = inter.component.custom_id or ""
         if not custom_id.startswith("leave:"):
             return
-        if not isinstance(inter.author, disnake.Member) or not inter.author.guild_permissions.administrator:
-            await inter.response.send_message("Только администратор может принять решение.", ephemeral=True)
+        if inter.guild_id != GUILD_ID:
+            return
+        if (
+            not isinstance(inter.author, disnake.Member)
+            or await member_access_level(self.bot, inter.author) < 4
+        ):
+            await inter.response.send_message(
+                "Рассматривать заявки на отпуск можно с уровня допуска 4.",
+                ephemeral=True,
+            )
             return
         try:
             _, status, raw_id = custom_id.split(":", 2)
             request_id = int(raw_id)
         except (ValueError, AttributeError):
+            return
+        if status not in {"approved", "declined"}:
             return
         request = await self.bot.database.review_leave(request_id, status, inter.author.id)
         if request is None:

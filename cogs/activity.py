@@ -21,7 +21,7 @@ from log_utils import send_admin_log
 from dm_notifications import send_dm_notification
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 VOICE_RECONCILE_INTERVAL_SECONDS = 60
@@ -30,7 +30,7 @@ VOICE_SHUTDOWN_TIMEOUT_SECONDS = 10
 
 
 class ActivityCog(commands.Cog):
-    def __init__(self, bot: "IntoleranceBot") -> None:
+    def __init__(self, bot: "InterpolovBot") -> None:
         self.bot = bot
         self.voice_sessions: dict[int, int] = {}
         self.voice_session_lock = asyncio.Lock()
@@ -1033,7 +1033,7 @@ class ActivityCog(commands.Cog):
                 value="💬 Минимум одно сообщение\n🎙️ Минимум 30 минут в voice",
                 inline=False,
             )
-            embed.set_footer(text="INTERPOLOV & INTOLERANCE • Контроль активности")
+            embed.set_footer(text="INTERPOLOV • Контроль активности")
 
             delivery = await send_dm_notification(
                 self.bot,

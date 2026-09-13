@@ -7,7 +7,7 @@ import disnake
 from log_utils import send_admin_log
 
 if TYPE_CHECKING:
-    from bot import IntoleranceBot
+    from bot import InterpolovBot
 
 
 DM_DISABLED_REASON = "не отправлено: система уведомлений в ЛС отключена"
@@ -21,7 +21,7 @@ class DMDeliveryResult:
 
 
 async def send_dm_notification(
-    bot: "IntoleranceBot",
+    bot: "InterpolovBot",
     recipient: disnake.abc.User,
     *,
     context: str,

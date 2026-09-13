@@ -9,12 +9,14 @@ import asyncpg
 import disnake
 
 from cogs.mafia_notifications import personal_events
+from cogs.family_ranks import family_rank_from_roles, recruitment_positions_from_roles
 
 from config import (
     APPLICATION_COOLDOWN_DAYS,
     DATABASE_URL,
     FAMILY_MEMBER_ROLE_ID,
     FAMILY_NAME,
+    FAMILY_RANK_ROLE_IDS,
     GUILD_ID,
     MAFIA_CLEANUP_DELAY_SECONDS,
     SERVER_ROLE_IDS,
@@ -114,6 +116,16 @@ class Database:
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS inactive_at TIMESTAMPTZ;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity_warning_at TIMESTAMPTZ;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS family_name TEXT;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS family_rank TEXT NOT NULL
+                    DEFAULT 'young';
+                ALTER TABLE users
+                    DROP CONSTRAINT IF EXISTS users_family_rank_check,
+                    ADD CONSTRAINT users_family_rank_check CHECK (family_rank IN (
+                        'young', 'main', 'old', 'high famq', 'deputy leader',
+                        'tech', 'leader', 'curator', 'owner'
+                    ));
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS recruitment_positions
+                    TEXT[] NOT NULL DEFAULT '{}';
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_inactivity_notice_at TIMESTAMPTZ;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS activity_check_after TIMESTAMPTZ;
                 UPDATE users SET is_active=FALSE, inactive_reason=COALESCE(inactive_reason, 'Роли сняты за неактивность'),
@@ -242,6 +254,26 @@ class Database:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
 
+                CREATE TABLE IF NOT EXISTS promotion_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    discord_id BIGINT NOT NULL REFERENCES users(discord_id) ON DELETE CASCADE,
+                    from_rank TEXT NOT NULL,
+                    target_rank TEXT NOT NULL,
+                    server_name TEXT,
+                    achievements TEXT NOT NULL,
+                    evidence TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','approved','declined','cancelled')),
+                    log_message_id BIGINT,
+                    role_change_started BOOLEAN NOT NULL DEFAULT FALSE,
+                    reviewed_by BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    reviewed_at TIMESTAMPTZ
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS promotion_requests_one_pending_user_idx
+                    ON promotion_requests(guild_id,discord_id) WHERE status='pending';
+
                 CREATE TABLE IF NOT EXISTS meetings (
                     id BIGSERIAL PRIMARY KEY,
                     voice_channel_id BIGINT NOT NULL,
@@ -327,6 +359,9 @@ class Database:
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS application_json_path TEXT;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS transcript_path TEXT;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS transcript_saved_at TIMESTAMPTZ;
+                ALTER TABLE applications ADD COLUMN IF NOT EXISTS transcript_log_message_id BIGINT;
+                ALTER TABLE applications ADD COLUMN IF NOT EXISTS cooldown_reset
+                    BOOLEAN NOT NULL DEFAULT FALSE;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS guild_id BIGINT;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS family_name TEXT;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS game_server TEXT
@@ -506,6 +541,22 @@ class Database:
                 CREATE INDEX IF NOT EXISTS giveaway_winners_history_idx
                     ON giveaway_winners(giveaway_id,selected_at);
 
+                CREATE TABLE IF NOT EXISTS protected_log_messages (
+                    message_id BIGINT PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    channel_id BIGINT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS security_role_removals (
+                    guild_id BIGINT NOT NULL,
+                    member_id BIGINT NOT NULL,
+                    role_id BIGINT NOT NULL,
+                    removed_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY(guild_id,member_id,role_id,removed_at)
+                );
+                CREATE INDEX IF NOT EXISTS security_role_removals_member_time_idx
+                    ON security_role_removals(guild_id,member_id,removed_at);
+
                 CREATE TABLE IF NOT EXISTS command_access_levels (
                     guild_id BIGINT NOT NULL,
                     command_name TEXT NOT NULL,
@@ -536,6 +587,14 @@ class Database:
                     ON game_servers(guild_id, role_id) WHERE role_id IS NOT NULL;
                 CREATE UNIQUE INDEX IF NOT EXISTS game_servers_guild_name_ci_idx
                     ON game_servers(guild_id, LOWER(name));
+                CREATE TABLE IF NOT EXISTS application_staff_roles (
+                    guild_id BIGINT NOT NULL,
+                    server_id BIGINT NOT NULL REFERENCES game_servers(id) ON DELETE CASCADE,
+                    role_id BIGINT NOT NULL,
+                    access_level SMALLINT NOT NULL CHECK(access_level IN (2,4)),
+                    PRIMARY KEY(guild_id,role_id),
+                    UNIQUE(server_id,access_level)
+                );
                 CREATE TABLE IF NOT EXISTS families (
                     id BIGSERIAL PRIMARY KEY,
                     guild_id BIGINT NOT NULL,
@@ -628,12 +687,12 @@ class Database:
                 GUILD_ID,
                 FAMILY_NAME,
             )
-            combined_family = await connection.fetchrow(
+            family = await connection.fetchrow(
                 "SELECT id FROM families WHERE guild_id=$1 AND LOWER(name)=LOWER($2)",
                 GUILD_ID,
                 FAMILY_NAME,
             )
-            if combined_family is None:
+            if family is None:
                 await connection.execute(
                     """INSERT INTO families(guild_id,name,role_id,added_by)
                     VALUES($1,$2,$3,$4)""",
@@ -646,7 +705,7 @@ class Database:
                 await connection.execute(
                     """UPDATE families SET name=$2,role_id=$3,active=TRUE,updated_at=NOW()
                     WHERE id=$1""",
-                    combined_family["id"],
+                    family["id"],
                     FAMILY_NAME,
                     FAMILY_MEMBER_ROLE_ID,
                 )
@@ -781,9 +840,43 @@ class Database:
                 """,
                 values,
             )
+            for member in family_members:
+                await self.sync_user_family_roles(member)
         except asyncpg.PostgresError:
             logging.exception("Could not save users to PostgreSQL")
             raise
+
+    async def sync_user_family_roles(self, member: disnake.Member) -> None:
+        if member.guild.id != GUILD_ID or member.bot:
+            return
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        role_ids = {role.id for role in member.roles}
+        # Mafia temporarily holds administrator roles, including the developer's.
+        held_roles = await self.pool.fetch(
+            """SELECT role_ids FROM mafia_role_holds
+            WHERE guild_id=$1 AND discord_id=$2 AND restored_at IS NULL""",
+            member.guild.id, member.id,
+        )
+        for row in held_roles:
+            role_ids.update(row["role_ids"])
+        recruiters = await self.pool.fetch(
+            """SELECT role_id FROM application_staff_roles
+            WHERE guild_id=$1 AND access_level=2
+            UNION SELECT member_role_id AS role_id FROM department_config
+            WHERE guild_id=$1 AND department='recruiters'""",
+            member.guild.id,
+        )
+        rank = family_rank_from_roles(role_ids)
+        positions = recruitment_positions_from_roles(
+            role_ids, {row["role_id"] for row in recruiters if row["role_id"] is not None}
+        )
+        await self.pool.execute(
+            """UPDATE users SET family_rank=$2,recruitment_positions=$3,updated_at=NOW()
+            WHERE discord_id=$1 AND (family_rank IS DISTINCT FROM $2
+                OR recruitment_positions IS DISTINCT FROM $3::TEXT[])""",
+            member.id, rank, positions,
+        )
 
     async def get_user(self, discord_id: int) -> asyncpg.Record | None:
         if self.pool is None:
@@ -1056,6 +1149,83 @@ class Database:
             "SELECT voice_seconds_since($1, '-infinity'::TIMESTAMPTZ)", discord_id,
         )
         return int(value)
+
+    async def create_promotion_request(
+        self, guild_id: int, discord_id: int, from_rank: str, target_rank: str,
+        server_name: str | None, achievements: str, evidence: str,
+    ) -> asyncpg.Record:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        ranks = list(FAMILY_RANK_ROLE_IDS)
+        if guild_id != GUILD_ID or ranks.index(target_rank) <= ranks.index(from_rank):
+            raise ValueError("Invalid promotion")
+        return await self.pool.fetchrow(
+            """INSERT INTO promotion_requests(
+                guild_id,discord_id,from_rank,target_rank,server_name,achievements,evidence
+            ) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *""",
+            guild_id, discord_id, from_rank, target_rank, server_name, achievements, evidence,
+        )
+
+    async def set_promotion_log_message(self, request_id: int, message_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            "UPDATE promotion_requests SET log_message_id=$2 WHERE id=$1 AND status='pending'",
+            request_id, message_id,
+        )
+
+    async def cancel_unpublished_promotion(self, request_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """UPDATE promotion_requests SET status='cancelled'
+            WHERE id=$1 AND status='pending' AND log_message_id IS NULL""", request_id,
+        )
+
+    @asynccontextmanager
+    async def promotion_review_lock(self, request_id: int):
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            # A session lock permits a durable checkpoint before the Discord request.
+            key = f"promotion:{request_id}"
+            await connection.execute("SELECT pg_advisory_lock(hashtextextended($1,0))", key)
+            try:
+                yield connection
+            finally:
+                await connection.execute("SELECT pg_advisory_unlock(hashtextextended($1,0))", key)
+
+    async def get_promotion_request(
+        self, connection: asyncpg.Connection, guild_id: int, request_id: int,
+    ) -> asyncpg.Record | None:
+        return await connection.fetchrow(
+            "SELECT * FROM promotion_requests WHERE guild_id=$1 AND id=$2", guild_id, request_id,
+        )
+
+    async def start_promotion_role_change(
+        self, connection: asyncpg.Connection, request_id: int, reviewer_id: int,
+    ) -> None:
+        await connection.execute(
+            """UPDATE promotion_requests SET role_change_started=TRUE,reviewed_by=$2
+            WHERE id=$1 AND status='pending'""", request_id, reviewer_id,
+        )
+
+    async def finish_promotion_request(
+        self, connection: asyncpg.Connection, request_id: int, status: str, reviewer_id: int,
+    ) -> asyncpg.Record | None:
+        if status not in {"approved", "declined"}:
+            raise ValueError("Invalid promotion decision")
+        async with connection.transaction():
+            request = await connection.fetchrow(
+                """UPDATE promotion_requests SET status=$2,reviewed_by=$3,reviewed_at=NOW()
+                WHERE id=$1 AND status='pending' RETURNING *""", request_id, status, reviewer_id,
+            )
+            if request is not None and status == "approved":
+                await connection.execute(
+                    "UPDATE users SET family_rank=$2,updated_at=NOW() WHERE discord_id=$1",
+                    request["discord_id"], request["target_rank"],
+                )
+            return request
 
     async def create_leave_request(self, discord_id: int, reason: str, days: int) -> asyncpg.Record:
         if self.pool is None:
@@ -1507,12 +1677,21 @@ class Database:
             raise RuntimeError("Database is not connected")
         created_at = await self.pool.fetchval(
             """SELECT MAX(created_at) FROM applications
-            WHERE guild_id=$1 AND discord_id=$2""",
+            WHERE guild_id=$1 AND discord_id=$2 AND NOT cooldown_reset""",
             guild_id, discord_id,
         )
         if created_at is None:
             return None
         return created_at + timedelta(days=APPLICATION_COOLDOWN_DAYS)
+
+    async def reset_application_cooldown(self, guild_id: int, discord_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """UPDATE applications SET cooldown_reset=TRUE
+            WHERE guild_id=$1 AND discord_id=$2 AND NOT cooldown_reset""",
+            guild_id, discord_id,
+        )
 
     async def has_open_application(self, discord_id: int, guild_id: int) -> bool:
         if self.pool is None:
@@ -1614,12 +1793,20 @@ class Database:
             )
 
     async def set_application_transcript(self, application_id: int, path: str) -> None:
-        if self.pool is not None:
-            await self.pool.execute(
-                """UPDATE applications SET transcript_path=$2,transcript_saved_at=NOW(),
-                updated_at=NOW() WHERE id=$1""",
-                application_id, path,
-            )
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """UPDATE applications SET transcript_path=$2,transcript_saved_at=NOW(),
+            transcript_log_message_id=NULL,updated_at=NOW() WHERE id=$1""",
+            application_id, path,
+        )
+
+    async def set_application_transcript_log_message(self, application_id: int, message_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            "UPDATE applications SET transcript_log_message_id=$2 WHERE id=$1", application_id, message_id,
+        )
 
     async def get_active_users(self) -> list[asyncpg.Record]:
         if self.pool is None:
@@ -2123,7 +2310,11 @@ class Database:
         if self.pool is None or not role_ids:
             return 0
         return int(await self.pool.fetchval(
-            """SELECT COALESCE(MAX(access_level),0) FROM access_level_roles
+            """SELECT COALESCE(MAX(access_level),0) FROM (
+                SELECT guild_id,role_id,access_level FROM access_level_roles
+                UNION ALL
+                SELECT guild_id,role_id,access_level FROM application_staff_roles
+            ) AS roles
             WHERE guild_id=$1 AND role_id=ANY($2::BIGINT[])""",
             guild_id, list(role_ids),
         ))
@@ -2136,6 +2327,10 @@ class Database:
             async with connection.transaction():
                 await connection.execute(
                     "DELETE FROM access_level_roles WHERE guild_id=$1 AND role_id=$2",
+                    guild_id, role_id,
+                )
+                await connection.execute(
+                    "DELETE FROM application_staff_roles WHERE guild_id=$1 AND role_id=$2",
                     guild_id, role_id,
                 )
                 await connection.execute(
@@ -2158,6 +2353,98 @@ class Database:
                     AND status IN('active','drawing','claiming')""",
                     guild_id, role_id,
                 )
+
+    async def record_protected_log_messages(
+        self, guild_id: int, channel_id: int, message_ids: list[int]
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.executemany(
+            """INSERT INTO protected_log_messages(message_id,guild_id,channel_id)
+            VALUES($1,$2,$3) ON CONFLICT DO NOTHING""",
+            [(message_id, guild_id, channel_id) for message_id in message_ids],
+        )
+
+    async def get_protected_log_message_ids(
+        self, guild_id: int, channel_id: int, message_ids: set[int]
+    ) -> set[int]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return {
+            row["message_id"] for row in await self.pool.fetch(
+                """SELECT message_id FROM protected_log_messages
+                WHERE guild_id=$1 AND channel_id=$2 AND message_id=ANY($3::BIGINT[])""",
+                guild_id, channel_id, list(message_ids),
+            )
+        }
+
+    async def prune_protected_log_messages(self, before_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute("DELETE FROM protected_log_messages WHERE message_id<$1", before_id)
+
+    async def record_security_role_removals(
+        self, guild_id: int, member_id: int, role_ids: list[int], removed_at: datetime
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.executemany(
+            """INSERT INTO security_role_removals(guild_id,member_id,role_id,removed_at)
+            VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING""",
+            [(guild_id, member_id, role_id, removed_at) for role_id in role_ids],
+        )
+
+    async def get_security_role_removals(
+        self, guild_id: int, member_id: int, since: datetime
+    ) -> list[asyncpg.Record]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetch(
+            """SELECT role_id,removed_at FROM security_role_removals
+            WHERE guild_id=$1 AND member_id=$2 AND removed_at >= $3""",
+            guild_id, member_id, since,
+        )
+
+    async def get_application_staff_roles(self, guild_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        return await self.pool.fetch(
+            """SELECT r.*,s.name AS server_name FROM application_staff_roles r
+            JOIN game_servers s ON s.id=r.server_id AND s.guild_id=r.guild_id
+            WHERE r.guild_id=$1 ORDER BY s.name,r.access_level""", guild_id,
+        )
+
+    async def set_application_staff_roles(
+        self, guild_id: int, server_id: int, recruiter_role_id: int, high_role_id: int
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                server = await connection.fetchval(
+                    "SELECT id FROM game_servers WHERE guild_id=$1 AND id=$2 FOR UPDATE",
+                    guild_id, server_id,
+                )
+                if server is None:
+                    raise ValueError("Game server no longer exists")
+                await connection.execute(
+                    "DELETE FROM application_staff_roles WHERE guild_id=$1 AND server_id=$2",
+                    guild_id, server_id,
+                )
+                await connection.executemany(
+                    """INSERT INTO application_staff_roles(guild_id,server_id,role_id,access_level)
+                    VALUES($1,$2,$3,$4)""",
+                    [(guild_id, server_id, recruiter_role_id, 2),
+                     (guild_id, server_id, high_role_id, 4)],
+                )
+
+    async def get_ticket_applications(self, guild_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            return []
+        return await self.pool.fetch(
+            """SELECT * FROM applications WHERE guild_id=$1
+            AND ticket_channel_id IS NOT NULL ORDER BY id""", guild_id,
+        )
 
     async def get_game_servers(self, guild_id: int) -> list[asyncpg.Record]:
         if self.pool is None:
