@@ -41,6 +41,7 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         self.database = SimpleNamespace(
             record_security_role_removals=AsyncMock(),
             get_security_role_removals=AsyncMock(return_value=[]),
+            clear_security_role_removals=AsyncMock(),
         )
         self.bot = SimpleNamespace(database=self.database)
         self.cog = SystemsCog(self.bot)
@@ -108,6 +109,78 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         self.actor.remove_roles.assert_awaited_once()
         self.assertEqual(self.database.record_security_role_removals.call_args.args[:3], (GUILD_ID, 1, [102]))
         self.after.remove_roles.assert_not_awaited()
+
+    async def reset_role_timer(self):
+        inter = SimpleNamespace(
+            guild_id=GUILD_ID, author=self.member(DEVELOPER_USER_ID, []),
+            response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock(),
+        )
+        await SystemsCog.role_timer_reset.callback(self.cog, inter, self.after)
+        return inter
+
+    async def test_timer_reset_clears_memory_and_persistence_only_for_recipient(self):
+        records = [(self.role.id, self.now - timedelta(minutes=1))]
+        self.cog._security_role_removals[(GUILD_ID, self.after.id)] = records.copy()
+        self.cog._security_role_removals[(GUILD_ID, self.actor.id)] = records.copy()
+        self.prepare_restore()
+
+        async def clear(guild_id, member_id):
+            self.database.get_security_role_removals.return_value = []
+
+        self.database.clear_security_role_removals.side_effect = clear
+        await self.reset_role_timer()
+        self.database.clear_security_role_removals.assert_awaited_once_with(GUILD_ID, self.after.id)
+        self.assertNotIn((GUILD_ID, self.after.id), self.cog._security_role_removals)
+        self.assertEqual(self.cog._security_role_removals[(GUILD_ID, self.actor.id)], records)
+        await self.cog.security_member_role_restore(self.before, self.after)
+        self.actor.remove_roles.assert_not_awaited()
+        self.cog.find_security_audit_entry.assert_not_awaited()
+        # A fresh cog must not reload the cleared timer from storage.
+        self.cog = SystemsCog(self.bot)
+        await self.cog.security_member_role_restore(self.before, self.after)
+        self.actor.remove_roles.assert_not_awaited()
+
+    async def test_failed_timer_reset_preserves_protection(self):
+        records = [(self.role.id, self.now - timedelta(minutes=1))]
+        self.cog._security_role_removals[(GUILD_ID, self.after.id)] = records.copy()
+        self.database.clear_security_role_removals.side_effect = OSError('offline')
+        with self.assertLogs(level='ERROR'):
+            inter = await self.reset_role_timer()
+        self.assertIn('Не удалось', inter.edit_original_response.call_args.kwargs['content'])
+        self.assertEqual(self.cog._security_role_removals[(GUILD_ID, self.after.id)], records)
+        self.cog.find_security_audit_entry = AsyncMock(return_value=self.entry())
+        await self.cog.security_member_role_restore(self.before, self.after)
+        self.actor.remove_roles.assert_awaited_once()
+
+    async def test_new_punishment_after_reset_starts_protection_again(self):
+        await self.reset_role_timer()
+        await self.cog.record_security_role_removals(
+            self.after, [self.role], self.now - timedelta(seconds=1),
+        )
+        self.cog.find_security_audit_entry = AsyncMock(return_value=self.entry())
+        await self.cog.security_member_role_restore(self.before, self.after)
+        self.actor.remove_roles.assert_awaited_once()
+
+    async def test_timer_reset_cancels_restore_check_waiting_for_audit(self):
+        self.prepare_restore()
+
+        async def find_entry(*args, **kwargs):
+            await self.reset_role_timer()
+            return self.entry()
+
+        self.cog.find_security_audit_entry.side_effect = find_entry
+        await self.cog.security_member_role_restore(self.before, self.after)
+        self.actor.remove_roles.assert_not_awaited()
+
+    async def test_timer_reset_waits_for_inflight_punishment_record(self):
+        lock = self.cog._security_locks.setdefault(self.after.id, asyncio.Lock())
+        async with lock:
+            task = asyncio.create_task(self.reset_role_timer())
+            await asyncio.sleep(0)
+            self.database.clear_security_role_removals.assert_not_awaited()
+            await self.cog.record_security_role_removals(self.after, [self.role], self.now)
+        await task
+        self.assertNotIn((GUILD_ID, self.after.id), self.cog._security_role_removals)
 
     async def test_time_window_uses_audit_time_with_strict_three_hour_boundary(self):
         for age, expected in ((timedelta(hours=3, seconds=-1), True),
@@ -192,6 +265,48 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         developer = self.member(DEVELOPER_USER_ID, [self.staff_role])
         await self.cog.punish_unauthorized_blacklist_deletion(developer, [{'id': 1}])
         developer.remove_roles.assert_not_awaited()
+
+    async def test_developer_bot_invite_does_not_require_guild_member_or_roles(self):
+        for bot_id in (2, 3):
+            with self.subTest(bot_id=bot_id):
+                invited = self.member(bot_id, [])
+                invited.bot = True
+                invited.ban = AsyncMock()
+                entry = self.entry(actor_id=DEVELOPER_USER_ID)
+                entry.target.id = bot_id
+                self.cog.find_security_audit_entry = AsyncMock(return_value=entry)
+
+                await self.cog.security_bot_join(invited)
+
+                self.cog.find_security_audit_entry.assert_awaited_once_with(
+                    self.guild, disnake.AuditLogAction.bot_add, bot_id,
+                )
+                invited.ban.assert_not_awaited()
+                self.guild.fetch_member.assert_not_awaited()
+                self.database.record_security_role_removals.assert_not_awaited()
+                self.assertIn('6-й уровень', self.log.call_args.kwargs['description'])
+
+    async def test_unauthorized_bot_invite_still_bans_bot_and_punishes_actor(self):
+        invited = self.member(2, [])
+        invited.bot = True
+        invited.ban = AsyncMock()
+        self.cog.find_security_audit_entry = AsyncMock(return_value=self.entry())
+
+        await self.cog.security_bot_join(invited)
+
+        invited.ban.assert_awaited_once()
+        self.actor.remove_roles.assert_awaited_once()
+
+    async def test_bot_invite_with_unknown_actor_still_bans_bot(self):
+        invited = self.member(2, [])
+        invited.bot = True
+        invited.ban = AsyncMock()
+        self.cog.find_security_audit_entry = AsyncMock(return_value=None)
+
+        await self.cog.security_bot_join(invited)
+
+        invited.ban.assert_awaited_once()
+        self.assertIn('не найден пригласивший', self.log.call_args.kwargs['title'])
 
     async def test_logs_reach_both_channels_even_if_general_log_is_forbidden(self):
         general = Mock(spec=disnake.TextChannel)

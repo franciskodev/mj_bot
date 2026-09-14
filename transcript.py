@@ -146,7 +146,8 @@ def render_transcript(payload: dict[str, Any]) -> str:
     reviewer = authors.get(reviewer_id, {}).get("display_name") or payload.get("reviewer_name") or reviewer_id or "Не указан"
     status = {"accepted": "Принят", "declined": "Отклонён", "review": "На рассмотрении",
               "interview": "Вызван на обзвон", "pending": "Ожидает решения"}.get(application["status"], application["status"])
-    title = f'Заявка #{application["id"]} · INTERPOLOV'
+    recruiter = application.get("application_type") == "recruiter"
+    title = f'Заявка {"на рекрутёра " if recruiter else ""}#{application["id"]} · INTERPOLOV'
     metadata = [
         ("Заявитель", f"{applicant} · {applicant_id}"),
         ("Игровой сервер", application.get("game_server") or "Не указан"),
@@ -155,7 +156,7 @@ def render_transcript(payload: dict[str, Any]) -> str:
     ]
     cards = "".join(f'<div><span>{escape(label)}</span><strong>{escape(value)}</strong></div>' for label, value in metadata)
     form_fields = [("Игровой ник", "game_nickname"), ("Статик", "static_id"),
-                   ("Возраст OOC", "ooc_age"), ("Цель вступления", "goal")]
+                   ("Возраст OOC", "ooc_age"), ("Мотивация и опыт рекрутёра" if recruiter else "Цель вступления", "goal")]
     form = "".join(f'<p><strong>{label}:</strong> {escape(str(application[key]))}</p>'
                    for label, key in form_fields if application.get(key) is not None)
     if application.get("screenshot_url"):
@@ -253,7 +254,7 @@ async def save_application_json(
     path = ARCHIVE_ROOT / f"application-{application['id']}.json"
     payload = {
         "format_version": 1,
-        "type": "family_application",
+        "type": f"{application.get('application_type', 'family')}_application",
         "saved_at": disnake.utils.utcnow().isoformat(),
         "application": json_value(dict(application)),
         "previous_applications": [json_value(dict(item)) for item in previous],

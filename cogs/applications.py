@@ -15,6 +15,7 @@ from config import (
     APPLICATION_COOLDOWN_DAYS,
     APPLICATION_EXTRA_ACCEPTED_ROLE_IDS,
     APPLICATION_LOG_CHANNEL_ID,
+    BASE_RECRUIT_ROLE_ID,
     DEVELOPER_USER_ID,
     FAMILY_MEMBER_ROLE_ID,
     FAMILY_NAME,
@@ -35,10 +36,12 @@ STATUS_NAMES = {
     "accepted": "Принят",
     "declined": "Отклонён",
 }
-def server_select(family_id: int, server_rows) -> disnake.ui.StringSelect:
+def server_select(
+    family_id: int, server_rows, application_type: str = "family"
+) -> disnake.ui.StringSelect:
     return disnake.ui.StringSelect(
         placeholder="Выберите игровой сервер",
-        custom_id=f"family_application:server:{family_id}",
+        custom_id=f"{application_type}_application:server:{family_id}",
         min_values=1,
         max_values=1,
         options=[
@@ -57,7 +60,23 @@ def application_buttons(application_id: int) -> list[disnake.ui.Button]:
     ]
 
 
-def application_panel() -> tuple[disnake.Embed, list[disnake.ui.Button]]:
+def application_panel(application_type: str = "family") -> tuple[disnake.Embed, list[disnake.ui.Button]]:
+    if application_type == "recruiter":
+        embed = disnake.Embed(
+            title=f"{FAMILY_NAME} • Набор рекрутёров",
+            description=(
+                "Хотите стать рекрутёром семьи? Нажмите кнопку, выберите игровой "
+                "сервер и заполните анкету. Бот создаст приватный тикет "
+                "с Chief Recruit и Deputy Chief Recruit.\n\n"
+                f"Подавать заявки на рекрутёра можно раз в {APPLICATION_COOLDOWN_DAYS} дней."
+            ),
+            color=disnake.Color.red(),
+        )
+        embed.set_footer(text=f"{FAMILY_NAME} • Набор рекрутёров")
+        return embed, [disnake.ui.Button(
+            label="Подать заявку на рекрутёра", style=disnake.ButtonStyle.primary,
+            custom_id="recruiter_application:open",
+        )]
     embed = disnake.Embed(
         title=FAMILY_NAME,
         description=(
@@ -82,8 +101,9 @@ def application_embed(
     applicant: disnake.Member,
     previous: list[asyncpg.Record],
 ) -> disnake.Embed:
+    recruiter = application.get("application_type") == "recruiter"
     embed = disnake.Embed(
-        title=f"📝 Заявление в {application['family_name']} #{application['id']}",
+        title=application_title(application),
         description=f"Кандидат: {applicant.mention}",
         color=disnake.Color.gold(),
         timestamp=application["created_at"],
@@ -105,34 +125,44 @@ def application_embed(
     embed.add_field(name="🎮 Ник в игре", value=application["game_nickname"], inline=True)
     embed.add_field(name="#️⃣ Статик", value=application["static_id"], inline=True)
     embed.add_field(name="🎂 Возраст OOC", value=str(application["ooc_age"]), inline=True)
-    embed.add_field(name="🎯 Цель вступления", value=application["goal"], inline=False)
+    embed.add_field(name="🎯 Мотивация и опыт рекрутёра" if recruiter else "🎯 Цель вступления", value=application["goal"], inline=False)
     embed.add_field(name="🖼️ Фото всех персонажей", value=application["screenshot_url"], inline=False)
     embed.add_field(name="👤 Пользователь", value=f"{applicant.mention}\n`{applicant}` · `{applicant.id}`", inline=False)
     embed.add_field(name="📌 Статус", value=STATUS_NAMES[application["status"]], inline=False)
-    embed.set_footer(text="INTERPOLOV • Общий набор")
+    embed.set_footer(text=f"{FAMILY_NAME} • " + ("Набор рекрутёров" if recruiter else "Общий набор"))
     return embed
+
+
+def application_title(application) -> str:
+    target = "Заявка на рекрутёра" if application.get("application_type") == "recruiter" else "Заявление в"
+    return f"📝 {target} {FAMILY_NAME} #{application['id']}"
 
 
 class ApplicationModal(disnake.ui.Modal):
     def __init__(
         self, cog: "ApplicationsCog", config: asyncpg.Record, family: asyncpg.Record,
         game_server: str,
+        application_type: str = "family",
     ) -> None:
         self.cog = cog
         self.config = config
         self.family_id = family["id"]
         self.family_name = FAMILY_NAME
         self.game_server = game_server
+        self.application_type = application_type
         components = [
             disnake.ui.TextInput(label="Ваш ник в игре", custom_id="game_nickname", max_length=100),
             disnake.ui.TextInput(label="Статик #", custom_id="static_id", max_length=30),
             disnake.ui.TextInput(label="Возраст OOC", custom_id="ooc_age", max_length=2),
-            disnake.ui.TextInput(label="Цель вступления", custom_id="goal", style=disnake.TextInputStyle.paragraph, max_length=500),
+            disnake.ui.TextInput(
+                label="Почему хотите стать рекрутёром? Ваш опыт" if application_type == "recruiter" else "Цель вступления",
+                custom_id="goal", style=disnake.TextInputStyle.paragraph, max_length=500,
+            ),
             disnake.ui.TextInput(label="Фото всех персонажей (ссылкой)", custom_id="screenshot_url", max_length=500),
         ]
         super().__init__(
-            title=f"Заявка в {self.family_name}",
-            custom_id=f"family_application:modal:{self.family_id}",
+            title="Заявка на рекрутёра INTERPOLOV" if application_type == "recruiter" else f"Заявка в {self.family_name}",
+            custom_id=f"{application_type}_application:modal:{self.family_id}",
             components=components,
             timeout=600,
         )
@@ -153,7 +183,7 @@ class ApplicationModal(disnake.ui.Modal):
                 await self._submit_application(inter)
 
     async def _submit_application(self, inter: disnake.ModalInteraction) -> None:
-        if not await self.cog.can_submit_application(inter):
+        if not await self.cog.can_submit_application(inter, self.application_type):
             return
         try:
             age = int(inter.text_values["ooc_age"])
@@ -169,7 +199,7 @@ class ApplicationModal(disnake.ui.Modal):
             return
         if inter.guild_id is None:
             return
-        if await self.cog.bot.database.has_open_application(inter.author.id, inter.guild_id):
+        if await self.cog.bot.database.has_open_application(inter.author.id, inter.guild_id, self.application_type):
             await inter.response.send_message("У вас уже есть открытая заявка.", ephemeral=True)
             return
 
@@ -177,10 +207,16 @@ class ApplicationModal(disnake.ui.Modal):
         guild = inter.guild
         if guild is None:
             return
-        category = guild.get_channel(self.config["category_id"])
-        staff_roles = await self.cog.application_staff_roles(guild, self.game_server)
+        config = await self.cog.get_config(guild.id, self.application_type)
+        if config is None:
+            await inter.edit_original_response("Система заявок ещё не настроена.")
+            return
+        category = guild.get_channel(config["category_id"])
+        staff_roles = await self.cog.application_staff_roles(guild, self.game_server, self.application_type)
         if not isinstance(category, disnake.CategoryChannel) or not staff_roles or guild.me is None:
             await inter.edit_original_response(
+                "Не найдены роли Chief Recruit / Deputy Chief Recruit или категория тикетов. Сообщите администратору."
+                if self.application_type == "recruiter" else
                 "Для выбранного сервера не настроены роли рекрутёров и High или категория тикетов. "
                 "Сообщите администратору: `/applications roles`."
             )
@@ -190,7 +226,7 @@ class ApplicationModal(disnake.ui.Modal):
         overwrites = self.cog.ticket_overwrites(guild, inter.author, staff_roles)
         try:
             ticket = await category.create_text_channel(
-                f"family-{self.family_id}-{safe_name}",
+                f"{self.application_type}-{self.family_id}-{safe_name}",
                 overwrites=overwrites,
                 reason=f"Заявка в {self.family_name} от {inter.author}",
             )
@@ -210,6 +246,7 @@ class ApplicationModal(disnake.ui.Modal):
             age,
             inter.text_values["goal"].strip(),
             screenshot_url,
+            self.application_type,
         )
         blacklist_entries = await self.cog.bot.database.find_blacklist_entries(
             inter.author.id, parse_static_ids(application["static_id"])
@@ -233,6 +270,7 @@ class ApplicationModal(disnake.ui.Modal):
         previous = [
             row for row in await self.cog.bot.database.get_previous_applications(inter.author.id, application["id"])
             if row["guild_id"] == guild.id and row["game_server"] == self.game_server
+            and row.get("application_type", "family") == self.application_type
         ]
         application_json_path = None
         try:
@@ -254,7 +292,7 @@ class ApplicationModal(disnake.ui.Modal):
             try:
                 await archive.send(
                     content=(
-                        f"🧾 **Новая заявка в {self.family_name} #{application['id']}**\n"
+                        f"**{application_title(application)}**\n"
                         f"Кандидат: {inter.author.mention} · Тикет: {ticket.mention}"
                     ),
                     embed=embed,
@@ -274,7 +312,8 @@ class ApplicationsCog(commands.Cog):
         ] = WeakValueDictionary()
 
     async def can_submit_application(
-        self, inter: disnake.MessageInteraction | disnake.ModalInteraction
+        self, inter: disnake.MessageInteraction | disnake.ModalInteraction,
+        application_type: str = "family",
     ) -> bool:
         if inter.guild_id not in GUILD_IDS:
             return False
@@ -287,7 +326,7 @@ class ApplicationsCog(commands.Cog):
             )
             cooldown_until = (
                 await self.bot.database.get_application_cooldown_until(
-                    inter.guild_id, inter.author.id
+                    inter.guild_id, inter.author.id, application_type
                 ) if not blocked else None
             )
         except (asyncpg.PostgresError, OSError, RuntimeError):
@@ -321,10 +360,16 @@ class ApplicationsCog(commands.Cog):
             if failures:
                 logging.error("Could not fully migrate %s application tickets in guild %s", failures, guild_id)
             await self.refresh_application_panel(guild_id)
+            await self.refresh_application_panel(guild_id, "recruiter")
             await self._repair_finalized_application_tickets(guild_id)
 
-    async def refresh_application_panel(self, guild_id: int) -> bool:
-        config = await self.bot.database.get_application_config(guild_id)
+    async def get_config(self, guild_id: int, application_type: str = "family"):
+        if application_type == "recruiter":
+            return await self.bot.database.get_recruiter_application_config(guild_id)
+        return await self.bot.database.get_application_config(guild_id)
+
+    async def refresh_application_panel(self, guild_id: int, application_type: str = "family") -> bool:
+        config = await self.get_config(guild_id, application_type)
         if config is None or config["panel_message_id"] is None:
             return False
         channel = self.bot.get_channel(config["panel_channel_id"])
@@ -332,7 +377,7 @@ class ApplicationsCog(commands.Cog):
             return False
         try:
             message = await channel.fetch_message(config["panel_message_id"])
-            embed, buttons = application_panel()
+            embed, buttons = application_panel(application_type)
             await message.edit(embed=embed, components=buttons)
         except disnake.DiscordException:
             logging.exception("Could not refresh application panel in guild %s", guild_id)
@@ -340,11 +385,12 @@ class ApplicationsCog(commands.Cog):
         return True
 
     async def application_staff_roles(
-        self, guild: disnake.Guild, game_server: str
+        self, guild: disnake.Guild, game_server: str, application_type: str = "family"
     ) -> list[disnake.Role]:
-        role_ids = await application_staff_role_ids(self.bot, guild.id, game_server)
+        role_ids = await application_staff_role_ids(self.bot, guild.id, game_server, application_type)
         roles = [guild.get_role(role_id) for role_id in sorted(role_ids)]
-        if len(roles) != 2 or any(role is None or role.is_default() for role in roles):
+        expected = 2
+        if len(roles) != expected or any(role is None or role.is_default() for role in roles):
             return []
         return roles
 
@@ -402,7 +448,9 @@ class ApplicationsCog(commands.Cog):
                     if not await self._sync_application_message(message, application):
                         failures += 1
                         continue
-                roles = await self.application_staff_roles(guild, application["game_server"])
+                roles = await self.application_staff_roles(
+                    guild, application["game_server"], application.get("application_type", "family")
+                )
                 overwrites = self.ticket_overwrites(guild, applicant, roles)
                 if channel.overwrites != overwrites:
                     await channel.edit(overwrites=overwrites, reason="Доступ к заявке по серверным ролям")
@@ -482,14 +530,16 @@ class ApplicationsCog(commands.Cog):
             return False
 
         embed = message.embeds[0]
-        embed.title = f"📝 Заявление в {FAMILY_NAME} #{application['id']}"
-        embed.set_footer(text=f"{FAMILY_NAME} • Набор в семью")
+        embed.title = application_title(application)
+        recruiter = application.get("application_type") == "recruiter"
+        embed.set_footer(text=f"{FAMILY_NAME} • " + ("Набор рекрутёров" if recruiter else "Набор в семью"))
         previous = [
             row for row in await self.bot.database.get_previous_applications(
                 application["discord_id"], application["id"]
             )
             if row["guild_id"] == application["guild_id"]
             and row["game_server"] == application["game_server"]
+            and row.get("application_type", "family") == application.get("application_type", "family")
         ]
         history = "\n".join(
             f"`#{row['id']}` · **{FAMILY_NAME}** — "
@@ -974,9 +1024,10 @@ class ApplicationsCog(commands.Cog):
         self, inter: disnake.MessageInteraction
     ) -> None:
         custom_id = inter.component.custom_id or ""
-        if not custom_id.startswith("family_application:server:"):
+        if not custom_id.startswith(("family_application:server:", "recruiter_application:server:")):
             return
-        if not await self.can_submit_application(inter):
+        application_type = "recruiter" if custom_id.startswith("recruiter_application:") else "family"
+        if not await self.can_submit_application(inter, application_type):
             return
 
         try:
@@ -997,11 +1048,11 @@ class ApplicationsCog(commands.Cog):
             await inter.response.send_message("Некорректный или устаревший выбор.", ephemeral=True)
             return
 
-        config = await self.bot.database.get_application_config(inter.guild_id)
+        config = await self.get_config(inter.guild_id, application_type)
         if config is None:
             await inter.response.send_message("Система заявок ещё не настроена.", ephemeral=True)
             return
-        if await self.bot.database.has_open_application(inter.author.id, inter.guild_id):
+        if await self.bot.database.has_open_application(inter.author.id, inter.guild_id, application_type):
             await inter.response.send_message("У вас уже есть открытая заявка.", ephemeral=True)
             return
 
@@ -1011,7 +1062,49 @@ class ApplicationsCog(commands.Cog):
                 config,
                 family,
                 ", ".join(row["name"] for row in chosen_servers),
+                application_type,
             )
+        )
+
+    @applications.sub_command(name="recruiter_setup", description="Создать отдельную панель заявок на рекрутёра (уровень 5)")
+    async def applications_recruiter_setup(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        panel_channel: disnake.TextChannel = commands.Param(description="Канал с кнопкой заявки на рекрутёра"),
+        ticket_category: disnake.CategoryChannel = commands.Param(description="Категория приватных тикетов рекрутёров"),
+    ) -> None:
+        if inter.guild_id not in GUILD_IDS or inter.guild is None:
+            return
+        if panel_channel.id == APPLICATION_LOG_CHANNEL_ID:
+            await inter.response.send_message("Выберите другой канал: это закрытый архив заявок.", ephemeral=True)
+            return
+        family_role = inter.guild.get_role(FAMILY_MEMBER_ROLE_ID)
+        if family_role is None:
+            await inter.response.send_message("Роль семьи INTERPOLOV не найдена.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True)
+        message = None
+        try:
+            await self.bot.database.upsert_family(
+                inter.guild_id, FAMILY_NAME, family_role.id, inter.author.id
+            )
+            embed, buttons = application_panel("recruiter")
+            message = await panel_channel.send(embed=embed, components=buttons)
+            await self.bot.database.save_recruiter_application_config(
+                inter.guild_id, panel_channel.id, ticket_category.id, message.id
+            )
+        except (disnake.DiscordException, asyncpg.PostgresError, OSError, RuntimeError):
+            logging.exception("Could not set up recruiter application panel")
+            if message is not None:
+                try:
+                    await message.delete()
+                except disnake.DiscordException:
+                    logging.exception("Could not remove unsaved recruiter panel")
+            await inter.edit_original_response("Не удалось создать панель. Проверьте доступ к базе и права бота в канале.")
+            return
+        await inter.edit_original_response(
+            f"✅ Панель заявок на рекрутёра создана в {panel_channel.mention}. "
+            "Роли рекрутёров и High для каждого сервера настраиваются через `/applications roles`."
         )
 
     @applications.sub_command(name="setup", description="Создать панель заявок")
@@ -1080,8 +1173,9 @@ class ApplicationsCog(commands.Cog):
     @commands.Cog.listener("on_button_click")
     async def application_button(self, inter: disnake.MessageInteraction) -> None:
         custom_id = inter.component.custom_id or ""
-        if custom_id == "family_application:open" or custom_id.startswith("family_application:open:"):
-            if not await self.can_submit_application(inter):
+        if custom_id in {"family_application:open", "recruiter_application:open"} or custom_id.startswith("family_application:open:"):
+            application_type = "recruiter" if custom_id.startswith("recruiter_application:") else "family"
+            if not await self.can_submit_application(inter, application_type):
                 return
             family = await self.bot.database.get_family_by_name(
                 inter.guild_id, FAMILY_NAME
@@ -1096,16 +1190,16 @@ class ApplicationsCog(commands.Cog):
                     "Семья INTERPOLOV или игровые серверы ещё не настроены.", ephemeral=True
                 )
                 return
-            config = await self.bot.database.get_application_config(inter.guild_id)
+            config = await self.get_config(inter.guild_id, application_type)
             if config is None:
                 await inter.response.send_message("Система заявок ещё не настроена.", ephemeral=True)
                 return
-            if await self.bot.database.has_open_application(inter.author.id, inter.guild_id):
+            if await self.bot.database.has_open_application(inter.author.id, inter.guild_id, application_type):
                 await inter.response.send_message("У вас уже есть открытая заявка.", ephemeral=True)
                 return
             await inter.response.send_message(
                 "Выберите сервер, на который подаёте заявку:",
-                components=server_select(family["id"], server_rows),
+                components=server_select(family["id"], server_rows, application_type),
                 ephemeral=True,
             )
             return
@@ -1114,7 +1208,7 @@ class ApplicationsCog(commands.Cog):
 
         if not isinstance(inter.author, disnake.Member):
             return
-        if inter.guild_id is None:
+        if inter.guild_id not in GUILD_IDS:
             return
         try:
             _, status, raw_id = custom_id.split(":", 2)
@@ -1126,7 +1220,6 @@ class ApplicationsCog(commands.Cog):
             return
 
         await inter.response.defer()
-        config = await self.bot.database.get_application_config(inter.guild_id)
         current_application = await self.bot.database.get_application(application_id)
         if (
             current_application is None
@@ -1135,9 +1228,14 @@ class ApplicationsCog(commands.Cog):
             or not await can_review_application(self.bot, inter.author, current_application)
         ):
             await inter.followup.send(
-                "Обрабатывать заявку могут только рекрутёры и High её сервера.", ephemeral=True
+                "Обрабатывать заявку могут сотрудники её сервера; заявки на рекрутёра — "
+                "только Chief Recruit и Deputy Chief Recruit. "
+                "Собственную заявку на рекрутёра рассматривать нельзя.", ephemeral=True
             )
             return
+
+        application_type = current_application.get("application_type", "family")
+        config = await self.get_config(inter.guild_id, application_type)
 
         if status == "delete":
             application = await self.bot.database.get_application(application_id)
@@ -1242,64 +1340,94 @@ class ApplicationsCog(commands.Cog):
                 )
                 return
 
-            family = await self.bot.database.get_family_by_name(
-                inter.guild_id, FAMILY_NAME
-            )
-            family_role_id = family["role_id"] if family is not None else None
-            accepted_role = inter.guild.get_role(family_role_id) if family_role_id else None
-            if accepted_role is None:
-                await inter.followup.send(
-                    "❌ Роль выбранной семьи не найдена. Проверьте настройки семьи. "
-                    "Заявка оставлена открытой.",
-                    ephemeral=True,
+            if application_type == "recruiter":
+                staff = await self.bot.database.get_application_staff_roles(inter.guild_id)
+                recruiter_ids = [
+                    row["role_id"] for row in staff
+                    if row["server_name"] == current_application["game_server"]
+                    and row["access_level"] == 2
+                ]
+                accepted_role = inter.guild.get_role(recruiter_ids[0]) if len(recruiter_ids) == 1 else None
+                if accepted_role is None or accepted_role.is_default() or accepted_role.permissions.administrator:
+                    await inter.followup.send(
+                        "❌ Роль рекрутёра выбранного сервера не настроена или недопустима. "
+                        "Проверьте `/applications roles`. Заявка оставлена открытой.", ephemeral=True,
+                    )
+                    return
+                base_role = inter.guild.get_role(BASE_RECRUIT_ROLE_ID)
+                if base_role is None or base_role.is_default() or base_role.permissions.administrator:
+                    await inter.followup.send(
+                        "❌ Базовая роль Recruit не найдена или недопустима. Заявка оставлена открытой.",
+                        ephemeral=True,
+                    )
+                    return
+                roles_to_add = list(dict.fromkeys([accepted_role, base_role]))
+                if inter.author.id != DEVELOPER_USER_ID and any(
+                    role >= inter.author.top_role for role in roles_to_add
+                ):
+                    await inter.followup.send(
+                        "Нельзя выдать роль рекрутёра, которая не ниже вашей высшей роли.", ephemeral=True,
+                    )
+                    return
+            else:
+                family = await self.bot.database.get_family_by_name(
+                    inter.guild_id, FAMILY_NAME
                 )
-                return
+                family_role_id = family["role_id"] if family is not None else None
+                accepted_role = inter.guild.get_role(family_role_id) if family_role_id else None
+                if accepted_role is None:
+                    await inter.followup.send(
+                        "❌ Роль выбранной семьи не найдена. Проверьте настройки семьи. "
+                        "Заявка оставлена открытой.",
+                        ephemeral=True,
+                    )
+                    return
 
-            extra_accepted_roles = [
-                role
-                for role_id in APPLICATION_EXTRA_ACCEPTED_ROLE_IDS
-                if (role := inter.guild.get_role(role_id)) is not None
-            ]
-            missing_extra_role_ids = APPLICATION_EXTRA_ACCEPTED_ROLE_IDS - {
-                role.id for role in extra_accepted_roles
-            }
-            if missing_extra_role_ids:
-                await inter.followup.send(
-                    "❌ Не найдены дополнительные роли участника: "
-                    f"**{', '.join(map(str, sorted(missing_extra_role_ids)))}**. "
-                    "Заявка оставлена открытой.",
-                    ephemeral=True,
-                )
-                return
+                extra_accepted_roles = [
+                    role
+                    for role_id in APPLICATION_EXTRA_ACCEPTED_ROLE_IDS
+                    if (role := inter.guild.get_role(role_id)) is not None
+                ]
+                missing_extra_role_ids = APPLICATION_EXTRA_ACCEPTED_ROLE_IDS - {
+                    role.id for role in extra_accepted_roles
+                }
+                if missing_extra_role_ids:
+                    await inter.followup.send(
+                        "❌ Не найдены дополнительные роли участника: "
+                        f"**{', '.join(map(str, sorted(missing_extra_role_ids)))}**. "
+                        "Заявка оставлена открытой.",
+                        ephemeral=True,
+                    )
+                    return
 
-            selected_servers = {
-                server.strip()
-                for server in current_application["game_server"].split(",")
-            }
-            configured_servers = await self.bot.database.get_game_servers(inter.guild_id)
-            server_roles_by_name = {
-                row["name"]: role
-                for row in configured_servers
-                if row["role_id"] is not None
-                and (role := inter.guild.get_role(row["role_id"])) is not None
-            }
-            missing_servers = selected_servers - server_roles_by_name.keys()
-            if missing_servers:
-                await inter.followup.send(
-                    "❌ Не найдены роли игровых серверов: "
-                    f"**{', '.join(sorted(missing_servers))}**. "
-                    "Заявка оставлена открытой.",
-                    ephemeral=True,
-                )
-                return
+                selected_servers = {
+                    server.strip()
+                    for server in current_application["game_server"].split(",")
+                }
+                configured_servers = await self.bot.database.get_game_servers(inter.guild_id)
+                server_roles_by_name = {
+                    row["name"]: role
+                    for row in configured_servers
+                    if row["role_id"] is not None
+                    and (role := inter.guild.get_role(row["role_id"])) is not None
+                }
+                missing_servers = selected_servers - server_roles_by_name.keys()
+                if missing_servers:
+                    await inter.followup.send(
+                        "❌ Не найдены роли игровых серверов: "
+                        f"**{', '.join(sorted(missing_servers))}**. "
+                        "Заявка оставлена открытой.",
+                        ephemeral=True,
+                    )
+                    return
 
-            roles_to_add = list(
-                dict.fromkeys(
-                    [accepted_role]
-                    + extra_accepted_roles
-                    + [server_roles_by_name[name] for name in selected_servers]
+                roles_to_add = list(
+                    dict.fromkeys(
+                        [accepted_role]
+                        + extra_accepted_roles
+                        + [server_roles_by_name[name] for name in selected_servers]
+                    )
                 )
-            )
             missing_roles = [role for role in roles_to_add if role not in applicant.roles]
             bot_member = inter.guild.me
             unavailable_roles = [
@@ -1363,7 +1491,7 @@ class ApplicationsCog(commands.Cog):
                 await inter.followup.send("Заявка не найдена.", ephemeral=True)
             return
 
-        if status == "accepted" and applicant is not None and accepted_role is not None:
+        if status == "accepted" and applicant is not None and accepted_role is not None and application_type == "family":
             if accepted_role is not None and accepted_role in applicant.roles:
                 await self.bot.database.save_users([applicant], role_ids={accepted_role.id})
                 profile = await self.bot.database.get_user(applicant.id)
@@ -1398,7 +1526,7 @@ class ApplicationsCog(commands.Cog):
         if applicant is not None:
             try:
                 await applicant.send(
-                    f"Статус вашей заявки в **{application['family_name']}** "
+                    f"Статус вашей заявки {'на рекрутёра' if application_type == 'recruiter' else 'в семью'} **{application['family_name']}** "
                     f"**#{application_id}** изменён: **{STATUS_NAMES[status]}**.\n"
                     f"Решение принял: **{inter.author}** "
                     f"({inter.author.mention}, `{inter.author.id}`)."

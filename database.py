@@ -357,6 +357,8 @@ class Database:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS application_json_path TEXT;
+                ALTER TABLE applications ADD COLUMN IF NOT EXISTS application_type TEXT
+                    NOT NULL DEFAULT 'family' CHECK(application_type IN ('family','recruiter'));
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS transcript_path TEXT;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS transcript_saved_at TIMESTAMPTZ;
                 ALTER TABLE applications ADD COLUMN IF NOT EXISTS transcript_log_message_id BIGINT;
@@ -547,6 +549,17 @@ class Database:
                     channel_id BIGINT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS nickname_warnings (
+                    guild_id BIGINT NOT NULL,
+                    member_id BIGINT NOT NULL,
+                    nickname TEXT NOT NULL,
+                    deadline TIMESTAMPTZ NOT NULL,
+                    penalized_at TIMESTAMPTZ,
+                    PRIMARY KEY(guild_id,member_id)
+                );
+                CREATE INDEX IF NOT EXISTS nickname_warnings_due_idx
+                    ON nickname_warnings(guild_id,deadline) WHERE penalized_at IS NULL;
+
                 CREATE TABLE IF NOT EXISTS security_role_removals (
                     guild_id BIGINT NOT NULL,
                     member_id BIGINT NOT NULL,
@@ -594,6 +607,12 @@ class Database:
                     access_level SMALLINT NOT NULL CHECK(access_level IN (2,4)),
                     PRIMARY KEY(guild_id,role_id),
                     UNIQUE(server_id,access_level)
+                );
+                CREATE TABLE IF NOT EXISTS recruiter_application_config (
+                    guild_id BIGINT PRIMARY KEY,
+                    panel_channel_id BIGINT NOT NULL,
+                    category_id BIGINT NOT NULL,
+                    panel_message_id BIGINT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS families (
                     id BIGSERIAL PRIMARY KEY,
@@ -1625,6 +1644,26 @@ class Database:
             family_role_id,
         )
 
+    async def save_recruiter_application_config(
+        self, guild_id: int, panel_channel_id: int, category_id: int, message_id: int
+    ) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            """INSERT INTO recruiter_application_config
+            (guild_id,panel_channel_id,category_id,panel_message_id) VALUES($1,$2,$3,$4)
+            ON CONFLICT(guild_id) DO UPDATE SET panel_channel_id=$2,
+                category_id=$3,panel_message_id=$4""",
+            guild_id, panel_channel_id, category_id, message_id,
+        )
+
+    async def get_recruiter_application_config(self, guild_id: int) -> asyncpg.Record | None:
+        if self.pool is None:
+            return None
+        return await self.pool.fetchrow(
+            "SELECT * FROM recruiter_application_config WHERE guild_id=$1", guild_id
+        )
+
     async def set_application_panel_message(self, guild_id: int, message_id: int) -> None:
         if self.pool is not None:
             await self.pool.execute(
@@ -1671,14 +1710,15 @@ class Database:
         return result != "DELETE 0"
 
     async def get_application_cooldown_until(
-        self, guild_id: int, discord_id: int
+        self, guild_id: int, discord_id: int, application_type: str = "family"
     ) -> datetime | None:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
         created_at = await self.pool.fetchval(
             """SELECT MAX(created_at) FROM applications
-            WHERE guild_id=$1 AND discord_id=$2 AND NOT cooldown_reset""",
-            guild_id, discord_id,
+            WHERE guild_id=$1 AND discord_id=$2 AND NOT cooldown_reset
+                AND application_type=$3""",
+            guild_id, discord_id, application_type,
         )
         if created_at is None:
             return None
@@ -1693,13 +1733,16 @@ class Database:
             guild_id, discord_id,
         )
 
-    async def has_open_application(self, discord_id: int, guild_id: int) -> bool:
+    async def has_open_application(
+        self, discord_id: int, guild_id: int, application_type: str = "family"
+    ) -> bool:
         if self.pool is None:
             return False
         return bool(await self.pool.fetchval(
             """SELECT EXISTS(SELECT 1 FROM applications WHERE discord_id=$1
-            AND guild_id=$2 AND status IN('pending','review','interview'))""",
-            discord_id, guild_id,
+            AND guild_id=$2 AND application_type=$3
+            AND status IN('pending','review','interview'))""",
+            discord_id, guild_id, application_type,
         ))
 
     async def create_application(
@@ -1714,15 +1757,16 @@ class Database:
         ooc_age: int,
         goal: str,
         screenshot_url: str,
+        application_type: str = "family",
     ) -> asyncpg.Record:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
         return await self.pool.fetchrow(
             """INSERT INTO applications(
-                guild_id,family_name,game_server,discord_id,username,game_nickname,static_id,ooc_age,goal,screenshot_url
-            ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""",
+                guild_id,family_name,game_server,discord_id,username,game_nickname,static_id,ooc_age,goal,screenshot_url,application_type
+            ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *""",
             guild_id, family_name, game_server, discord_id, username,
-            game_nickname, static_id, ooc_age, goal, screenshot_url,
+            game_nickname, static_id, ooc_age, goal, screenshot_url, application_type,
         )
 
     async def set_application_ticket(
@@ -2403,6 +2447,56 @@ class Database:
             """SELECT role_id,removed_at FROM security_role_removals
             WHERE guild_id=$1 AND member_id=$2 AND removed_at >= $3""",
             guild_id, member_id, since,
+        )
+
+    async def get_nickname_warning(self, guild_id: int, member_id: int) -> asyncpg.Record | None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetchrow(
+            "SELECT * FROM nickname_warnings WHERE guild_id=$1 AND member_id=$2", guild_id, member_id,
+        )
+
+    async def save_nickname_warning(
+        self, guild_id: int, member_id: int, nickname: str, deadline: datetime
+    ) -> asyncpg.Record:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetchrow(
+            """INSERT INTO nickname_warnings(guild_id,member_id,nickname,deadline)
+            VALUES($1,$2,$3,$4) ON CONFLICT(guild_id,member_id)
+            DO UPDATE SET nickname=EXCLUDED.nickname RETURNING *""",
+            guild_id, member_id, nickname, deadline,
+        )
+
+    async def clear_nickname_warning(self, guild_id: int, member_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            "DELETE FROM nickname_warnings WHERE guild_id=$1 AND member_id=$2", guild_id, member_id,
+        )
+
+    async def mark_nickname_penalty(self, guild_id: int, member_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            "UPDATE nickname_warnings SET penalized_at=NOW() WHERE guild_id=$1 AND member_id=$2",
+            guild_id, member_id,
+        )
+
+    async def get_due_nickname_warnings(self, guild_id: int) -> list[asyncpg.Record]:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        return await self.pool.fetch(
+            "SELECT * FROM nickname_warnings WHERE guild_id=$1 AND deadline<=NOW() AND penalized_at IS NULL",
+            guild_id,
+        )
+
+    async def clear_security_role_removals(self, guild_id: int, member_id: int) -> None:
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        await self.pool.execute(
+            "DELETE FROM security_role_removals WHERE guild_id=$1 AND member_id=$2",
+            guild_id, member_id,
         )
 
     async def get_application_staff_roles(self, guild_id: int) -> list[asyncpg.Record]:

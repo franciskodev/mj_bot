@@ -24,6 +24,7 @@ from cogs.log_protection import LogProtectionCog
 from cogs.mafia import MafiaCog
 from cogs.meetings import MeetingsCog
 from cogs.management import ManagementCog
+from cogs.nicknames import NicknamesCog
 from cogs.promotions import PromotionsCog
 from cogs.server_tags import ServerTagsCog
 from cogs.systems import SystemsCog
@@ -65,6 +66,7 @@ class InterpolovBot(commands.InteractionBot):
         self.add_cog(ManagementCog(self))
         self.add_cog(PromotionsCog(self))
         self.add_cog(ServerTagsCog(self))
+        self.add_cog(NicknamesCog(self))
         self.add_cog(WarningsCog(self))
         self.add_cog(ApplicationsCog(self))
         self.add_cog(SystemsCog(self))

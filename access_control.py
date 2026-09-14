@@ -4,7 +4,10 @@ from typing import TYPE_CHECKING
 
 import disnake
 
-from config import DEVELOPER_USER_ID, FAMILY_MEMBER_ROLE_ID, FAMILY_RANK_ROLE_IDS, GUILD_ID, TARGET_ROLE_IDS
+from config import (
+    DEVELOPER_USER_ID, FAMILY_MEMBER_ROLE_ID, FAMILY_RANK_ROLE_IDS, GUILD_ID,
+    RECRUITMENT_POSITION_ROLE_IDS, TARGET_ROLE_IDS,
+)
 from cogs.family_ranks import family_rank_from_roles
 
 if TYPE_CHECKING:
@@ -65,10 +68,14 @@ DEFAULT_COMMAND_LEVELS = {
     "settings show": 5,
     "broadcast": 5,
     "dm_notifications": 6,
+    "role_give": 6,
+    "role_timer_reset": 6,
+    "rank_set": 4,
 }
 
 # Эти команды нельзя ослабить пользовательской настройкой.
 PROTECTED_COMMAND_LEVELS = {
+    "applications recruiter_setup": 5,
     "applications roles": 5,
     "applications roles_show": 5,
     "mafia create": 5,
@@ -89,6 +96,9 @@ PROTECTED_COMMAND_LEVELS = {
     "settings show": 5,
     "broadcast": 5,
     "dm_notifications": 6,
+    "role_give": 6,
+    "role_timer_reset": 6,
+    "rank_set": 4,
 }
 
 
@@ -162,8 +172,11 @@ async def family_role_ids(bot: "InterpolovBot", guild_id: int) -> set[int]:
 
 
 async def application_staff_role_ids(
-    bot: "InterpolovBot", guild_id: int, game_server: str
+    bot: "InterpolovBot", guild_id: int, game_server: str,
+    application_type: str = "family",
 ) -> set[int]:
+    if application_type == "recruiter":
+        return set(RECRUITMENT_POSITION_ROLE_IDS.values()) if guild_id == GUILD_ID else set()
     # Legacy applications with several servers stay visible only to admins and
     # the applicant: granting the union would disclose them across teams.
     return {
@@ -174,14 +187,18 @@ async def application_staff_role_ids(
 
 
 async def can_review_application(bot: "InterpolovBot", member: disnake.Member, application) -> bool:
-    if member.guild.id != application["guild_id"]:
+    if member.guild.id != GUILD_ID or member.guild.id != application["guild_id"]:
         return False
+    if application.get("application_type") == "recruiter":
+        return member.id != application.get("discord_id") and bool(
+            {role.id for role in member.roles} & set(RECRUITMENT_POSITION_ROLE_IDS.values())
+        )
     if member.id == DEVELOPER_USER_ID or member.guild_permissions.administrator:
         return True
     return (
         await member_access_level(bot, member) >= 2
         and bool({role.id for role in member.roles} & await application_staff_role_ids(
-            bot, member.guild.id, application["game_server"]
+            bot, member.guild.id, application["game_server"], application.get("application_type", "family")
         ))
     )
 
@@ -213,4 +230,19 @@ async def promotion_approval_error(
         return "Discord-роль выбранного ранга не найдена."
     if target_role >= reviewer.top_role or applicant.top_role >= reviewer.top_role:
         return "Роль повышения и высшая роль заявителя должны быть строго ниже вашей Discord-роли."
+    return None
+
+
+async def rank_assignment_error(bot, reviewer, member, target_rank: str) -> str | None:
+    error = await promotion_approval_error(bot, reviewer, member, target_rank)
+    if error:
+        return error
+    ranks = list(FAMILY_RANK_ROLE_IDS)
+    own_rank = family_rank_from_roles({role.id for role in reviewer.roles})
+    current_rank = family_rank_from_roles({role.id for role in member.roles})
+    if ranks.index(current_rank) >= ranks.index(own_rank):
+        return "Нельзя менять ранг участнику с вашим или более высоким семейным рангом."
+    for participant in (reviewer, member):
+        if await bot.database.get_mafia_saved_access(GUILD_ID, participant.id):
+            return "Дождитесь восстановления ролей участников после Mafia."
     return None

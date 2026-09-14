@@ -14,9 +14,10 @@ from access_control import (
     PROTECTED_COMMAND_LEVELS,
     command_access_level,
     member_access_level,
+    rank_assignment_error,
 )
 from config import (
-    BLACKLIST_CHANNEL_ID, DEVELOPER_USER_ID, FAMILY_NAME, GUILD_IDS,
+    BLACKLIST_CHANNEL_ID, DEVELOPER_USER_ID, FAMILY_NAME, FAMILY_RANK_ROLE_IDS, GUILD_IDS,
     SECURITY_ROLE_RESTORE_WINDOW_HOURS,
 )
 from log_utils import send_admin_log, send_security_log
@@ -200,6 +201,7 @@ class SystemsCog(commands.Cog):
         self._role_removal_penalties: dict[int, datetime] = {}
         self._processed_role_restoration_entries: dict[int, datetime] = {}
         self._security_role_removals: dict[tuple[int, int], list[tuple[int, datetime]]] = {}
+        self._security_role_reset_versions: dict[tuple[int, int], int] = {}
 
     async def find_security_audit_entry(
         self,
@@ -411,6 +413,8 @@ class SystemsCog(commands.Cog):
         # Wait for any in-flight punishment of the recipient to be recorded.
         lock = self._security_locks.setdefault(after.id, asyncio.Lock())
         async with lock:
+            reset_key = (after.guild.id, after.id)
+            reset_version = self._security_role_reset_versions.get(reset_key, 0)
             removals = list(self._security_role_removals.get((after.guild.id, after.id), ()))
             try:
                 removals.extend(
@@ -452,6 +456,10 @@ class SystemsCog(commands.Cog):
             actor = await self.security_actor(after.guild, entry)
             if actor is None or self.is_current_bot(actor):
                 continue
+            # A developer may reset the timer while Discord publishes the audit
+            # entry. Do not punish using the snapshot taken before that reset.
+            if self._security_role_reset_versions.get(reset_key, 0) != reset_version:
+                return
             await self.remove_security_actor_roles(
                 actor,
                 event_name="возврат ролей после наказания защитой",
@@ -543,6 +551,21 @@ class SystemsCog(commands.Cog):
             disnake.AuditLogAction.bot_add,
             member.id,
         )
+        # Level 6 belongs to this user ID even when their guild member cannot
+        # be fetched (or their administrator roles are temporarily removed).
+        if entry is not None and getattr(entry.user, "id", None) == DEVELOPER_USER_ID:
+            await send_security_log(
+                self.bot,
+                title="🛡️ Разрешённое приглашение бота",
+                description=(
+                    f"Пригласивший: <@{DEVELOPER_USER_ID}> (`{DEVELOPER_USER_ID}`)\n"
+                    f"Бот: {member.mention} (`{member.id}`)\n"
+                    "Основание: **6-й уровень допуска (разработчик)**."
+                ),
+                color=disnake.Color.green(),
+            )
+            return
+
         actor = await self.security_actor(member.guild, entry) if entry else None
         if actor is None:
             ban_status = await self.ban_unauthorized_bot(member)
@@ -1428,6 +1451,159 @@ class SystemsCog(commands.Cog):
         await inter.response.send_message(
             "\n".join(lines) or "Дополнительные роли доступа ещё не настроены.",
             ephemeral=True,
+        )
+
+    @commands.slash_command(
+        name="rank_set", description="Установить семейный ранг участнику (уровень 4)",
+        guild_ids=GUILD_IDS,
+    )
+    async def rank_set(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        member: disnake.Member = commands.Param(name="участник"),
+        rank: str = commands.Param(name="ранг", choices=list(FAMILY_RANK_ROLE_IDS)),
+    ) -> None:
+        if inter.guild is None:
+            return
+        await inter.response.defer(ephemeral=True)
+        lock = self._security_locks.setdefault(member.id, asyncio.Lock())
+        async with lock:
+            try:
+                reviewer = await inter.guild.fetch_member(inter.author.id)
+                member = await inter.guild.fetch_member(member.id)
+                error = await rank_assignment_error(self.bot, reviewer, member, rank)
+                if error:
+                    await inter.edit_original_response(content=error)
+                    return
+                target = inter.guild.get_role(FAMILY_RANK_ROLE_IDS[rank])
+                rank_ids = set(FAMILY_RANK_ROLE_IDS.values())
+                old_roles = [role for role in member.roles if role.id in rank_ids]
+                bot_member = inter.guild.me
+                if (
+                    bot_member is None or not bot_member.guild_permissions.manage_roles
+                    or member.id == inter.guild.owner_id or member.top_role >= bot_member.top_role
+                    or any(role.managed or role >= bot_member.top_role for role in [*old_roles, target])
+                ):
+                    await inter.edit_original_response(
+                        content="Бот не может изменить эти роли. Проверьте право «Управлять ролями» и иерархию."
+                    )
+                    return
+                roles = [role for role in member.roles if not role.is_default() and role.id not in rank_ids]
+                await member.edit(roles=[*roles, target], reason=f"Установка ранга {rank}: {reviewer.id}")
+            except (disnake.DiscordException, asyncpg.PostgresError, OSError, RuntimeError):
+                logging.exception("Could not set family rank for member %s", member.id)
+                await inter.edit_original_response(content="Не удалось установить ранг. Проверьте роли и повторите команду.")
+                return
+        await inter.edit_original_response(content=f"✅ Для {member.mention} установлен ранг **{rank}**.")
+        await send_admin_log(
+            self.bot, title="🏅 Семейный ранг установлен",
+            description=f"Участник: {member.mention}\nРанг: **{rank}**\nВыдал: {reviewer.mention}",
+        )
+
+    @commands.slash_command(
+        name="role_timer_reset",
+        description="Сбросить таймер наказания за возврат ролей участнику (разработчик)",
+        guild_ids=GUILD_IDS,
+    )
+    async def role_timer_reset(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        member: disnake.Member = commands.Param(name="участник", description="Чей таймер сбросить"),
+    ) -> None:
+        if inter.guild_id is None:
+            return
+        await inter.response.defer(ephemeral=True)
+        lock = self._security_locks.setdefault(member.id, asyncio.Lock())
+        async with lock:
+            try:
+                await self.bot.database.clear_security_role_removals(inter.guild_id, member.id)
+            except (asyncpg.PostgresError, OSError, RuntimeError):
+                logging.exception("Could not reset security role timer for member %s", member.id)
+                await inter.edit_original_response(
+                    content="Не удалось сбросить таймер: база данных недоступна. Повторите команду позже."
+                )
+                return
+            key = (inter.guild_id, member.id)
+            self._security_role_removals.pop(key, None)
+            self._security_role_reset_versions[key] = self._security_role_reset_versions.get(key, 0) + 1
+
+        await inter.edit_original_response(
+            content=(
+                f"✅ Таймер для {member.mention} сброшен. Теперь ему можно вернуть роли "
+                "без наказания выдавшего их участника. "
+                "Новое снятие ролей защитой запустит таймер снова."
+            )
+        )
+        await send_security_log(
+            self.bot,
+            title="🛡️ Таймер возврата ролей сброшен",
+            description=(
+                f"Разработчик: {inter.author.mention} (`{inter.author.id}`)\n"
+                f"Участник: {member.mention} (`{member.id}`)"
+            ),
+            color=disnake.Color.green(),
+        )
+
+    @commands.slash_command(
+        name="role_give",
+        description="Выдать участнику роль ниже роли бота (только разработчик)",
+        guild_ids=GUILD_IDS,
+    )
+    async def role_give(
+        self,
+        inter: disnake.ApplicationCommandInteraction,
+        member: disnake.Member = commands.Param(name="участник", description="Получатель роли"),
+        role: disnake.Role = commands.Param(name="роль", description="Роль для выдачи"),
+    ) -> None:
+        if inter.guild is None:
+            return
+        bot_member = inter.guild.me
+        if bot_member is None or not bot_member.guild_permissions.manage_roles:
+            await inter.response.send_message(
+                "У бота нет права **Управлять ролями**.", ephemeral=True
+            )
+            return
+        if role.is_default() or role.managed:
+            await inter.response.send_message(
+                "Нельзя выдать @everyone или роль, управляемую Discord/интеграцией.",
+                ephemeral=True,
+            )
+            return
+        if not role < bot_member.top_role:
+            await inter.response.send_message(
+                "Выбранная роль должна быть строго ниже высшей роли бота.",
+                ephemeral=True,
+            )
+            return
+        if role in member.roles:
+            await inter.response.send_message(
+                f"У {member.mention} уже есть роль {role.mention}.", ephemeral=True
+            )
+            return
+
+        await inter.response.defer(ephemeral=True)
+        try:
+            await member.add_roles(
+                role, reason=f"Выдача роли разработчиком: {inter.author} ({inter.author.id})"
+            )
+        except disnake.DiscordException:
+            logging.exception("Could not grant role %s to member %s", role.id, member.id)
+            await inter.edit_original_response(
+                content="Не удалось выдать роль. Проверьте права и иерархию ролей бота."
+            )
+            return
+        await inter.edit_original_response(
+            content=f"✅ Участнику {member.mention} выдана роль {role.mention}."
+        )
+        await send_admin_log(
+            self.bot,
+            title="🔐 Роль выдана разработчиком",
+            description=(
+                f"Разработчик: {inter.author.mention} (`{inter.author.id}`)\n"
+                f"Участник: {member.mention} (`{member.id}`)\n"
+                f"Роль: {role.mention} (`{role.id}`)"
+            ),
+            color=disnake.Color.green(),
         )
 
     @commands.slash_command(
