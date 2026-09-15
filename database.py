@@ -560,6 +560,16 @@ class Database:
                 CREATE INDEX IF NOT EXISTS nickname_warnings_due_idx
                     ON nickname_warnings(guild_id,deadline) WHERE penalized_at IS NULL;
 
+                CREATE TABLE IF NOT EXISTS discord_link_violations (
+                    guild_id BIGINT NOT NULL,
+                    member_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    occurred_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY(guild_id,message_id)
+                );
+                CREATE INDEX IF NOT EXISTS discord_link_violations_member_time_idx
+                    ON discord_link_violations(guild_id,member_id,occurred_at);
+
                 CREATE TABLE IF NOT EXISTS security_role_removals (
                     guild_id BIGINT NOT NULL,
                     member_id BIGINT NOT NULL,
@@ -2426,6 +2436,34 @@ class Database:
         if self.pool is None:
             raise RuntimeError("Database is not connected")
         await self.pool.execute("DELETE FROM protected_log_messages WHERE message_id<$1", before_id)
+
+    async def record_discord_link_violation(
+        self, guild_id: int, member_id: int, message_id: int,
+        occurred_at: datetime, since: datetime,
+    ) -> bool | None:
+        """Return whether this is a repeat, or None for an already handled message."""
+        if self.pool is None:
+            raise RuntimeError("Database is not connected")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                # Serialize simultaneous messages, including across connections.
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1)", member_id,
+                )
+                inserted = await connection.fetchval(
+                    """INSERT INTO discord_link_violations
+                    (guild_id,member_id,message_id,occurred_at) VALUES($1,$2,$3,$4)
+                    ON CONFLICT DO NOTHING RETURNING message_id""",
+                    guild_id, member_id, message_id, occurred_at,
+                )
+                if inserted is None:
+                    return None
+                return await connection.fetchval(
+                    """SELECT EXISTS(SELECT 1 FROM discord_link_violations
+                    WHERE guild_id=$1 AND member_id=$2 AND message_id<>$3
+                    AND occurred_at >= $4 AND occurred_at <= $5)""",
+                    guild_id, member_id, message_id, since, occurred_at,
+                )
 
     async def record_security_role_removals(
         self, guild_id: int, member_id: int, role_ids: list[int], removed_at: datetime

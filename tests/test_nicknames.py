@@ -11,14 +11,18 @@ from config import DEVELOPER_USER_ID, FAMILY_RANK_ROLE_IDS, GUILD_ID, NICKNAME_L
 
 
 class NicknameFormatTests(unittest.TestCase):
-    def test_member_formats_and_derivatives(self):
-        for nickname in ('Nick_Name / 123', 'Nick Name | Иван | #123', 'Ник/123',
-                         'Nick \\ Name \\ 0012', 'Nick || 123', 'Nick ／ Иван ｜ 123',
-                         'Nick - Иван - # 123', 'Nick • 123'):
+    def test_member_requires_first_name_pipe_optional_real_name_and_static(self):
+        for nickname in ('Alex | 123', 'Alex | Иван | #123', 'Ник|123',
+                         ' Jean-Luc | Анна-Мария | 0012 ', "D'Angelo | 123"):
             with self.subTest(nickname=nickname):
                 self.assertTrue(valid_nickname(nickname, 'member', {'Seattle'}))
         for nickname in ('Nick', 'Nick / Name', '123 / 456', '/Nick/123', 'Nick/123/',
-                         'Nick/Name/Other/123', 'Nick/abc123', 'Nick\n/123', 'Nick\u200b/123'):
+                         'Nick/Name/Other/123', 'Nick/abc123', 'Nick\n|123', 'Nick\u200b|123',
+                         'Nick_Name | 123', 'Nick Name | Иван | 123', 'Nick/123',
+                         'Nick \\ Name \\ 123', 'Nick || 123', 'Nick - Иван - 123',
+                         'Nick • 123', 'Seattle | Nick | 123', 'Nick | Seattle | 123',
+                         'Nick | Иван | Seattle | 123', 'Nick | Иван | 123 Seattle',
+                         'Nick | Иван |', '|123', 'Nick | 123 |', 'Nick | abc123'):
             with self.subTest(nickname=nickname):
                 self.assertFalse(valid_nickname(nickname, 'member', {'Seattle'}))
 
@@ -109,6 +113,11 @@ class NicknameEnforcementTests(unittest.IsolatedAsyncioTestCase):
             await self.cog.check_member(self.member)
         self.assertEqual(self.warnings[(GUILD_ID, 100)]['deadline'], self.now + timedelta(hours=24))
         self.member.send.assert_awaited_once()
+        message = self.member.send.call_args.args[0]
+        self.assertIn('без фамилии', message)
+        self.assertIn('Название сервера писать не нужно', message)
+        self.assertIn('Alex | 12345', message)
+        self.assertNotIn('Вместо `/`', message)
         self.member.remove_roles.assert_not_awaited()
         self.db.get_dm_notifications_enabled.assert_not_awaited()
         self.assertEqual(self.log.call_args.kwargs['channel_id'], NICKNAME_LOG_CHANNEL_ID)
@@ -127,7 +136,7 @@ class NicknameEnforcementTests(unittest.IsolatedAsyncioTestCase):
         await self.cog.check_member(self.member, changed=True)
         self.assertEqual(self.warnings[(GUILD_ID, 100)]['deadline'], deadline)
         self.assertIn('Срок не изменился', self.member.send.call_args.args[0])
-        self.member.display_name = 'Nick/123'
+        self.member.display_name = 'Nick | 123'
         await self.cog.check_member(self.member, changed=True)
         self.assertFalse(self.warnings)
         self.assertIn('Таймер исправления сброшен', self.member.send.call_args.args[0])
@@ -163,7 +172,7 @@ class NicknameEnforcementTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_corrected_nickname_prevents_penalty_even_with_stale_cache(self):
         self.expired_warning()
         fresh = SimpleNamespace(**vars(self.member))
-        fresh.display_name = 'Nick/123'
+        fresh.display_name = 'Nick | 123'
         self.guild.fetch_member.return_value = fresh
         await self.cog.check_member(self.member)
         self.member.remove_roles.assert_not_awaited()
@@ -223,7 +232,7 @@ class NicknameEnforcementTests(unittest.IsolatedAsyncioTestCase):
         self.cog.check_member.assert_awaited_once_with(self.member, changed=True)
 
     async def test_duplicate_name_events_send_one_success(self):
-        self.member.display_name = 'Nick/123'
+        self.member.display_name = 'Nick | 123'
         await self.cog.check_member(self.member, changed=True)
         await self.cog.check_member(self.member, changed=True)
         self.member.send.assert_awaited_once()

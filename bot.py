@@ -17,6 +17,7 @@ from cogs.broadcast import BroadcastCog
 from cogs.chat_responses import ChatResponsesCog
 from cogs.core import CoreCog
 from cogs.direct_messages import DirectMessagesCog
+from cogs.invite_filter import InviteFilterCog
 from cogs.general import GeneralCog
 from cogs.giveaways import GiveawaysCog
 from cogs.leave import LeaveCog
@@ -70,6 +71,7 @@ class InterpolovBot(commands.InteractionBot):
         self.add_cog(WarningsCog(self))
         self.add_cog(ApplicationsCog(self))
         self.add_cog(SystemsCog(self))
+        self.add_cog(InviteFilterCog(self))
         self.add_cog(LogProtectionCog(self))
 
     def request_fatal_shutdown(self, error: BaseException) -> None:

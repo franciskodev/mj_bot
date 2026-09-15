@@ -27,10 +27,38 @@ class SecurityDatabaseTests(unittest.IsolatedAsyncioTestCase):
             'CREATE TABLE IF NOT EXISTS nickname_warnings (', 1
         )[1].split('CREATE TABLE IF NOT EXISTS command_access_levels (', 1)[0]
         await self.db.pool.execute(schema)
-        await self.db.pool.execute('TRUNCATE security_role_removals, nickname_warnings')
+        await self.db.pool.execute('TRUNCATE security_role_removals, nickname_warnings, discord_link_violations')
 
     async def asyncTearDown(self):
         await self.db.pool.close()
+
+    async def test_link_warning_window_scope_duplicates_and_reload(self):
+        now = disnake.utils.utcnow()
+        window = timedelta(hours=12)
+        record = self.db.record_discord_link_violation
+        self.assertFalse(await record(GUILD_ID, 10, 100, now, now - window))
+        self.assertIsNone(await record(GUILD_ID, 10, 100, now, now - window))
+        self.assertFalse(await record(GUILD_ID, 11, 101, now, now - window))
+        self.assertFalse(await record(123, 10, 100, now, now - window))
+        fresh = Database()
+        fresh.pool = self.db.pool
+        later = now + window
+        self.assertTrue(await fresh.record_discord_link_violation(
+            GUILD_ID, 10, 102, later, later - window,
+        ))
+        expired = later + window + timedelta(microseconds=1)
+        self.assertFalse(await record(GUILD_ID, 10, 103, expired, expired - window))
+
+    async def test_simultaneous_links_warn_once_then_escalate(self):
+        import asyncio
+
+        now = disnake.utils.utcnow()
+        results = await asyncio.gather(*(
+            self.db.record_discord_link_violation(
+                GUILD_ID, 10, message_id, now, now - timedelta(hours=12),
+            ) for message_id in (100, 101)
+        ))
+        self.assertCountEqual(results, [False, True])
 
     async def test_reset_is_persistent_scoped_and_allows_new_timer(self):
         now = disnake.utils.utcnow()

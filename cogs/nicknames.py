@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 
 NICKNAME_FORMATS = {
-    "member": "Никнейм / Статик или Никнейм / ИРЛ имя / Статик",
+    "member": "Имя в игре (без фамилии) | Имя в ИРЛ (по желанию) | Статик на мейн-сервере",
     "deputy leader": "Никнейм или Никнейм / ИРЛ имя",
     "leader": "Сервер / Никнейм или Сервер / Никнейм / ИРЛ имя",
 }
@@ -39,6 +39,18 @@ def valid_nickname(nickname: str, kind: str, server_names: set[str]) -> bool:
     nickname = unicodedata.normalize("NFKC", nickname).strip()
     if any(unicodedata.category(char).startswith("C") for char in nickname):
         return False
+    if kind == "member":
+        parts = [part.strip() for part in nickname.split("|")]
+        if len(parts) not in {2, 3}:
+            return False
+        servers = {unicodedata.normalize("NFKC", server).strip().casefold() for server in server_names}
+        # One first name per name block, allowing compound names such as Jean-Luc.
+        # Spaces, underscores and extra blocks must not hide a surname or server.
+        return all(
+            part.casefold() not in servers
+            and all(fragment.isalpha() for fragment in re.split(r"[-'’]", part))
+            for part in parts[:-1]
+        ) and bool(re.fullmatch(r"#?\s*[0-9]+", parts[-1]))
     parts = [part.strip() for part in re.split(r"[|/\\¦]+|\s+[-–—•·]\s+", nickname)]
     if any(not part for part in parts):
         return False
@@ -46,10 +58,6 @@ def valid_nickname(nickname: str, kind: str, server_names: set[str]) -> bool:
     def name(value: str) -> bool:
         return any(char.isalpha() for char in value)
 
-    if kind == "member":
-        return len(parts) in {2, 3} and all(name(part) for part in parts[:-1]) and bool(
-            re.fullmatch(r"#?\s*[0-9]+", parts[-1])
-        )
     if kind == "deputy leader":
         return len(parts) in {1, 2} and all(name(part) for part in parts)
     if kind == "leader":
@@ -137,7 +145,19 @@ class NicknamesCog(commands.Cog):
                 await self.log(member, "✅ Никнейм соответствует формату", "Таймер исправления сброшен.")
             return
 
-        instructions = f"Нужный формат: **{NICKNAME_FORMATS[kind]}**. Вместо `/` можно использовать `|`."
+        instructions = f"Нужный формат: **{NICKNAME_FORMATS[kind]}**.\n"
+        if kind == "member":
+            instructions += (
+                "Используйте только разделитель `|`. Укажите имя в игре **без фамилии** "
+                "и свой статик на основном сервере. **Название сервера писать не нужно.**\n"
+                "Примеры: `Alex | Иван | 12345` или `Alex | 12345`.\n"
+            )
+        else:
+            instructions += "Вместо `/` можно использовать `|`.\n"
+        instructions += (
+            "**ИРЛ имя — это имя в настоящей жизни. Указывать его необязательно:** "
+            "можно полностью пропустить этот блок вместе с лишним разделителем."
+        )
         if warning is None:
             deadline = now + timedelta(hours=NICKNAME_GRACE_HOURS)
             delivered = await self.notify(
