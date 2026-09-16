@@ -14,6 +14,7 @@ from config import (
     FAMILY_MEMBER_TRIGGER_ROLE_IDS,
     GUILD_ID,
     INACTIVITY_LOG_CHANNEL_ID,
+    MEDIA_ROLE_ID,
     TARGET_ROLE_IDS,
 )
 from database import BotInstanceLockLost, INSTANCE_LOCK_HEARTBEAT_SECONDS
@@ -115,8 +116,11 @@ class ActivityCog(commands.Cog):
         if member.bot or member.guild.id != GUILD_ID:
             return
 
-        member_role_ids = {role.id for role in member.roles}
         trigger_role_ids = await self.get_family_member_trigger_role_ids()
+        member = member.guild.get_member(member.id)
+        if member is None:
+            return
+        member_role_ids = {role.id for role in member.roles}
         if (
             FAMILY_MEMBER_ROLE_ID in member_role_ids
             or not member_role_ids.intersection(trigger_role_ids)
@@ -133,6 +137,15 @@ class ActivityCog(commands.Cog):
             return
 
         try:
+            # Recheck Discord: a queued update or periodic scan can be stale
+            # after another feature has removed the member's roles.
+            member = await member.guild.fetch_member(member.id)
+            member_role_ids = {role.id for role in member.roles}
+            if (
+                FAMILY_MEMBER_ROLE_ID in member_role_ids
+                or not member_role_ids.intersection(trigger_role_ids)
+            ):
+                return
             await member.add_roles(
                 family_member_role,
                 reason="Автоматическая роль участника семьи",
@@ -447,7 +460,11 @@ class ActivityCog(commands.Cog):
             return
         if after.id in self.automated_role_removals:
             return
-        await self.ensure_family_member_role(after)
+        # Role removal can arrive as several events. Do not restore famq
+        # while the remaining family roles are still being removed.
+        added_role_ids = {role.id for role in after.roles} - {role.id for role in before.roles}
+        if added_role_ids:
+            await self.ensure_family_member_role(after)
         family_role_ids = await self.get_family_role_ids()
         before_family_roles = [role for role in before.roles if role.id in family_role_ids]
         after_family_roles = [role for role in after.roles if role.id in family_role_ids]
@@ -737,7 +754,11 @@ class ActivityCog(commands.Cog):
             member = guild.get_member(profile["discord_id"])
             if member is None:
                 continue
-            if member.guild_permissions.administrator or await self.bot.database.get_mafia_saved_access(guild.id, member.id) >= 5:
+            if (
+                any(role.id == MEDIA_ROLE_ID for role in member.roles)
+                or member.guild_permissions.administrator
+                or await self.bot.database.get_mafia_saved_access(guild.id, member.id) >= 5
+            ):
                 continue
             if await self.ensure_voice_tracking_fresh(
                 expected_generation=generation,
@@ -785,7 +806,11 @@ class ActivityCog(commands.Cog):
                     member.id,
                 )
                 continue
-            if member.guild_permissions.administrator or await self.bot.database.get_mafia_saved_access(guild.id, member.id) >= 5:
+            if (
+                any(role.id == MEDIA_ROLE_ID for role in member.roles)
+                or member.guild_permissions.administrator
+                or await self.bot.database.get_mafia_saved_access(guild.id, member.id) >= 5
+            ):
                 continue
             if await self.ensure_voice_tracking_fresh(
                 expected_generation=generation,
@@ -990,7 +1015,10 @@ class ActivityCog(commands.Cog):
 
         for profile in await self.bot.database.get_daily_warning_users():
             member = guild.get_member(profile["discord_id"])
-            if member is None or member.bot:
+            if (
+                member is None or member.bot
+                or any(role.id == MEDIA_ROLE_ID for role in member.roles)
+            ):
                 continue
             if await self.ensure_voice_tracking_fresh(
                 expected_generation=generation,

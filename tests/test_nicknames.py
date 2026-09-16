@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import disnake
 
 from cogs.nicknames import NicknamesCog, nickname_format_kind, valid_nickname
-from config import DEVELOPER_USER_ID, FAMILY_RANK_ROLE_IDS, GUILD_ID, NICKNAME_LOG_CHANNEL_ID
+from config import DEVELOPER_USER_ID, FAMILY_MEMBER_ROLE_ID, FAMILY_RANK_ROLE_IDS, GUILD_ID, MEDIA_ROLE_ID, NICKNAME_LOG_CHANNEL_ID
 
 
 class NicknameFormatTests(unittest.TestCase):
@@ -159,6 +159,16 @@ class NicknameEnforcementTests(unittest.IsolatedAsyncioTestCase):
         self.member.remove_roles.assert_awaited_once()
         self.guild.fetch_member.assert_awaited_once_with(100)
 
+    async def test_penalty_removes_famq_and_trigger_roles_in_one_update(self):
+        famq = self.role(FAMILY_MEMBER_ROLE_ID, 1)
+        self.member.roles.insert(1, famq)
+        self.expired_warning()
+        await self.cog.check_member(self.member)
+        self.member.remove_roles.assert_awaited_once_with(
+            famq, self.family_role,
+            reason="Никнейм не исправлен в течение 24 часов", atomic=False,
+        )
+
     async def test_deadline_is_strict_and_does_not_penalize_early(self):
         self.expired_warning()
         self.warnings[(GUILD_ID, 100)]['deadline'] = self.now
@@ -216,6 +226,33 @@ class NicknameEnforcementTests(unittest.IsolatedAsyncioTestCase):
         await self.cog.check_member(self.member)
         self.member.remove_roles.assert_not_awaited()
         self.db.clear_nickname_warning.assert_not_awaited()
+
+    async def test_media_is_not_warned_for_invalid_nickname(self):
+        self.member.roles.append(self.role(MEDIA_ROLE_ID, 3))
+        await self.cog.check_member(self.member)
+        self.member.send.assert_not_awaited()
+        self.db.save_nickname_warning.assert_not_awaited()
+
+    async def test_media_on_live_member_cancels_expired_nickname_penalty(self):
+        self.expired_warning()
+        fresh = SimpleNamespace(**vars(self.member))
+        fresh.roles = [*self.member.roles, self.role(MEDIA_ROLE_ID, 3)]
+        self.guild.fetch_member.return_value = fresh
+        await self.cog.check_member(self.member)
+        self.member.remove_roles.assert_not_awaited()
+        self.member.send.assert_not_awaited()
+        self.assertFalse(self.warnings)
+
+    async def test_removing_media_starts_a_new_nickname_deadline(self):
+        media = self.role(MEDIA_ROLE_ID, 3)
+        self.member.roles.append(media)
+        self.expired_warning()
+        await self.cog.check_member(self.member)
+        self.member.roles.remove(media)
+        with patch('cogs.nicknames.disnake.utils.utcnow', return_value=self.now):
+            await self.cog.check_member(self.member)
+        self.assertEqual(self.warnings[(GUILD_ID, 100)]['deadline'], self.now + timedelta(hours=24))
+        self.member.remove_roles.assert_not_awaited()
 
     async def test_simultaneous_checks_warn_once(self):
         await asyncio.gather(*(self.cog.check_member(self.member) for _ in range(3)))

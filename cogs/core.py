@@ -36,10 +36,22 @@ class CoreCog(commands.Cog):
             logging.error("Default member role %s was not found", DEFAULT_MEMBER_ROLE_ID)
             return
 
-        for member in guild.members:
+        # Populate the cache before scanning so large guilds are not only
+        # checked for the subset of members already seen by the bot.
+        if not guild.chunked:
+            try:
+                await guild.chunk()
+            except (disnake.DiscordException, TimeoutError):
+                logging.exception("Could not load members for daily default role sync")
+                return
+
+        for member in list(guild.members):
             if member.bot or len(member.roles) != 1:
                 continue
             try:
+                member = await guild.fetch_member(member.id)
+                if member.bot or len(member.roles) != 1:
+                    continue
                 await member.add_roles(
                     role,
                     reason="Ежедневная проверка участников без ролей",

@@ -13,7 +13,7 @@ from access_control import family_role_ids
 from cogs.family_ranks import family_rank_from_roles
 from config import (
     DEVELOPER_USER_ID, FAMILY_MEMBER_TRIGGER_ROLE_IDS, GUILD_ID,
-    NICKNAME_GRACE_HOURS, NICKNAME_LOG_CHANNEL_ID,
+    MEDIA_ROLE_ID, NICKNAME_GRACE_HOURS, NICKNAME_LOG_CHANNEL_ID,
 )
 from log_utils import send_admin_log
 
@@ -99,6 +99,8 @@ class NicknamesCog(commands.Cog):
         if member.bot or member.id == DEVELOPER_USER_ID:
             return None
         roles = {role.id for role in member.roles}
+        if MEDIA_ROLE_ID in roles:
+            return None
         scope = await family_role_ids(self.bot, member.guild.id) | set(FAMILY_MEMBER_TRIGGER_ROLE_IDS)
         if not roles & scope:
             return None
@@ -197,7 +199,8 @@ class NicknamesCog(commands.Cog):
         roles = [role for role in member.roles if not role.is_default() and not role.managed and role < bot_member.top_role]
         if roles:
             try:
-                await member.remove_roles(*roles, reason="Никнейм не исправлен в течение 24 часов", atomic=True)
+                # One role update prevents intermediate states from restoring famq.
+                await member.remove_roles(*roles, reason="Никнейм не исправлен в течение 24 часов", atomic=False)
             except disnake.DiscordException:
                 await self.log(member, "⚠️ Ошибка снятия ролей за никнейм", "Discord не позволил снять все роли. Проверка будет повторена.")
                 return
