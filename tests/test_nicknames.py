@@ -188,13 +188,63 @@ class NicknameEnforcementTests(unittest.IsolatedAsyncioTestCase):
         self.member.remove_roles.assert_not_awaited()
         self.assertFalse(self.warnings)
 
-    async def test_failed_dm_does_not_start_unannounced_penalty(self):
+    async def test_failed_dm_keeps_first_deadline_and_does_not_repeat_after_restart(self):
         self.member.send.side_effect = disnake.DiscordException('closed DMs')
-        with self.assertLogs(level='WARNING'):
+        with self.assertLogs(level='WARNING'), patch('cogs.nicknames.disnake.utils.utcnow', return_value=self.now):
             await self.cog.check_member(self.member)
-        self.assertFalse(self.warnings)
+        deadline = self.now + timedelta(hours=24)
+        self.assertEqual(self.warnings[(GUILD_ID, 100)]['deadline'], deadline)
+        with patch.object(NicknamesCog, 'check_nicknames'), patch.object(NicknamesCog, 'check_deadlines'):
+            restarted = NicknamesCog(self.bot)
+        with patch('cogs.nicknames.disnake.utils.utcnow', return_value=self.now + timedelta(hours=1)):
+            await restarted.check_member(self.member)
+            await restarted.check_member(self.member, changed=True)
+        self.assertEqual(self.warnings[(GUILD_ID, 100)]['deadline'], deadline)
+        self.member.send.assert_awaited_once()
+        self.log.assert_awaited_once()
         self.member.remove_roles.assert_not_awaited()
         self.assertIn('не доставлено', self.log.call_args.kwargs['title'])
+
+        # The original deadline is enforced even if the initial DM failed.
+        with self.assertLogs(level='WARNING'), patch('cogs.nicknames.disnake.utils.utcnow', return_value=deadline):
+            await restarted.check_member(self.member)
+        self.member.remove_roles.assert_awaited_once()
+        self.db.mark_nickname_penalty.assert_awaited_once_with(GUILD_ID, 100)
+
+    async def test_initial_warning_is_saved_before_delivery(self):
+        async def deliver(*args, **kwargs):
+            self.assertIn((GUILD_ID, 100), self.warnings)
+
+        self.member.send.side_effect = deliver
+        await self.cog.check_member(self.member)
+        self.member.send.assert_awaited_once()
+
+    async def test_database_failure_does_not_send_unpersisted_deadline(self):
+        self.db.save_nickname_warning.side_effect = RuntimeError('database unavailable')
+        with self.assertLogs(level='ERROR'):
+            await self.cog.check_member(self.member)
+        self.member.send.assert_not_awaited()
+        self.member.remove_roles.assert_not_awaited()
+
+    async def test_restart_does_not_repeat_delivered_warning_for_same_name_event(self):
+        await self.cog.check_member(self.member)
+        with patch.object(NicknamesCog, 'check_nicknames'), patch.object(NicknamesCog, 'check_deadlines'):
+            restarted = NicknamesCog(self.bot)
+        await restarted.check_member(self.member, changed=True)
+        self.member.send.assert_awaited_once()
+
+    async def test_failed_rename_notice_preserves_deadline_and_is_not_repeated(self):
+        await self.cog.check_member(self.member)
+        deadline = self.warnings[(GUILD_ID, 100)]['deadline']
+        self.member.display_name = 'Still bad'
+        self.member.send.side_effect = disnake.DiscordException('closed DMs')
+        with self.assertLogs(level='WARNING'):
+            await self.cog.check_member(self.member, changed=True)
+        with patch.object(NicknamesCog, 'check_nicknames'), patch.object(NicknamesCog, 'check_deadlines'):
+            restarted = NicknamesCog(self.bot)
+        await restarted.check_member(self.member, changed=True)
+        self.assertEqual(self.warnings[(GUILD_ID, 100)]['deadline'], deadline)
+        self.assertEqual(self.member.send.await_count, 2)
 
     async def test_failed_removal_keeps_timer_for_retry(self):
         self.expired_warning()

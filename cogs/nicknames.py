@@ -162,17 +162,17 @@ class NicknamesCog(commands.Cog):
         )
         if warning is None:
             deadline = now + timedelta(hours=NICKNAME_GRACE_HOURS)
+            # Persist before delivery: closed DMs and restarts must not reset
+            # the deadline or cause another initial notification attempt.
+            warning = await database.save_nickname_warning(GUILD_ID, member.id, member.display_name, deadline)
             delivered = await self.notify(
                 member, f"⚠️ Исправьте никнейм на сервере INTERPOLOV. {instructions}\n"
-                f"Срок: <t:{int(deadline.timestamp())}:F> ({NICKNAME_GRACE_HOURS} часа). "
+                f"Срок: <t:{int(warning['deadline'].timestamp())}:F> ({NICKNAME_GRACE_HOURS} часа). "
                 "Если никнейм останется неправильным, ваши доступные боту роли будут сняты.",
             )
-            # Do not start a punitive deadline when the user could not be notified.
-            if not delivered:
-                return
-            warning = await database.save_nickname_warning(GUILD_ID, member.id, member.display_name, deadline)
-            await self.log(member, "⚠️ Требуется исправить никнейм", f"{instructions}\nСрок: <t:{int(warning['deadline'].timestamp())}:F>.")
-        elif changed or member.display_name != warning["nickname"]:
+            if delivered:
+                await self.log(member, "⚠️ Требуется исправить никнейм", f"{instructions}\nСрок: <t:{int(warning['deadline'].timestamp())}:F>.")
+        elif member.display_name != warning["nickname"]:
             await database.save_nickname_warning(GUILD_ID, member.id, member.display_name, warning["deadline"])
             await self.notify(
                 member, f"⚠️ Новый никнейм всё ещё не соответствует формату. {instructions}\n"
