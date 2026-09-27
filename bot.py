@@ -27,6 +27,7 @@ from cogs.meetings import MeetingsCog
 from cogs.management import ManagementCog
 from cogs.nicknames import NicknamesCog
 from cogs.promotions import PromotionsCog
+from cogs.role_logs import RoleLogsCog
 from cogs.server_tags import ServerTagsCog
 from cogs.systems import SystemsCog
 from cogs.users import UsersCog
@@ -73,6 +74,7 @@ class InterpolovBot(commands.InteractionBot):
         self.add_cog(SystemsCog(self))
         self.add_cog(InviteFilterCog(self))
         self.add_cog(LogProtectionCog(self))
+        self.add_cog(RoleLogsCog(self))
 
     def request_fatal_shutdown(self, error: BaseException) -> None:
         if self.fatal_error is None:
